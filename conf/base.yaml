@@ -28,6 +28,60 @@ overwrite: false
 # Controls distributed compute infrastructure for federated learning
 # Docs: https://docs.ray.io/en/latest/ray-core/api/doc/ray.init.html
 
+backend:
+  internal_backend: torchtitan   # options: torchdist, torchtitan
+
+# torchtitan:
+#   root: /home/sabiha/torchtitan-omnifed
+#   module: llama3
+#   config_name: llama3_debugmodel
+#   hf_assets_path: /home/sabiha/torchtitan-omnifed/tests/assets/tokenizer
+#   dataset_path: /home/sabiha/torchtitan-omnifed/tests/assets/c4_test
+#   output_dir: outputs/torchtitan_site
+#   update_dir: outputs/federated_updates
+#   overrides: {}
+
+# federated:
+#   local_steps: 100
+#   rounds: 10
+
+
+torchtitan:
+  root: /ccs/home/sabiha/torchtitan-omnifed
+  module: llama3
+  config_name: llama3_debugmodel
+  hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/tokenizer
+  dataset_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/c4_test
+  output_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/runtime
+  update_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/updates
+  overrides:
+    training.steps: 10
+    checkpoint.enable: true
+    checkpoint.last_save_model_only: true
+    parallelism.pipeline_parallel_degree: 2
+    parallelism.tensor_parallel_degree: 8
+    parallelism.enable_sequence_parallel: false
+    parallelism.data_parallel_replicate_degree: 1
+    parallelism.data_parallel_shard_degree: 1
+
+  subclusters:
+    enabled: true
+    num_clients: 2
+    nodes_per_client: 2
+    # nodes_per_client: [2, 3, 1]
+    gpus_per_node: 8
+    leader_rank: 0
+    master_port_base: 29600
+    checkpoint_root: /lustre/orion/gen150/scratch/sabiha/omnifed_titan
+
+  federated:
+    local_steps: 3
+    server_port: 50051
+    # initial_model_path: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/initial/model.pt
+    grpc_chunk_size_mb: 64
+    aggregation_timeout: 3600
+
+
 ray:
   # ─────────────────────────────────────────
   # Cluster Connection & Resource Allocation

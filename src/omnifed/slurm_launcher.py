@@ -175,3 +175,88 @@ class SlurmOnlyLauncher:
         out = subprocess.check_output(["sbatch", path], text=True).strip()
         print(f"[SlurmOnlyLauncher] sbatch response: {out}")
         raise SystemExit(0)
+
+class SlurmTorchTitanLauncher:
+    @staticmethod
+    def submit_or_exit(sconf: SlurmConfig, subcluster_cfg: dict) -> None:
+        assert sconf.work_dir and sconf.cfg_json_path
+
+        num_clients = int(subcluster_cfg["num_clients"])
+        nodes_per_client = int(subcluster_cfg["nodes_per_client"])
+        gpus_per_node = int(subcluster_cfg["gpus_per_node"])
+        checkpoint_root = subcluster_cfg["checkpoint_root"]
+        port_base = int(subcluster_cfg["master_port_base"])
+
+        pyexe = sconf.pyexe or "python"
+
+        leader_rank = int(subcluster_cfg["leader_rank"])
+
+        lines = ["#!/bin/bash"]
+        lines += sconf.sbatch_lines()
+        lines += ["set -euo pipefail"]
+
+        if sconf.setup_lines:
+            lines += sconf.setup_lines + [""]
+
+        lines += [
+            f'export PYTHONPATH="{sconf.work_dir}:${{PYTHONPATH:-}}"',
+            'PYEXE="${PYEXE:-python}"',
+            'mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")',
+            'SERVER_HOST="${HOSTS[0]}"',
+            f'CFG_JSON="{sconf.cfg_json_path}"',
+            f'CHECKPOINT_ROOT="{checkpoint_root}/job_${{SLURM_JOB_ID}}"',
+            'mkdir -p "$CHECKPOINT_ROOT"',
+            "",
+            'srun --exclusive --nodes=1 --ntasks=1 '
+            '--nodelist="$SERVER_HOST" '
+            'env OMNIFED_ROLE=server '
+            'FEDERATED_RANK=0 '
+            'CHECKPOINT_ROOT="$CHECKPOINT_ROOT" '
+            '"$PYEXE" -u -m src.omnifed.slurm_worker '
+            '--cfg-json "$CFG_JSON" &',
+        ]
+
+        for client_id in range(num_clients):
+            first_node = 1 + client_id * nodes_per_client
+            last_node = first_node + nodes_per_client - 1
+            world_size = nodes_per_client * gpus_per_node
+
+            lines += [
+                f'CLIENT_{client_id}_NODES=$(IFS=,; echo "${{HOSTS[*]:{first_node}:{nodes_per_client}}}")',
+                f'CLIENT_{client_id}_MASTER="${{HOSTS[{first_node}]}}"',
+                (
+                    f"srun --exclusive --nodes={nodes_per_client} "
+                    f"--ntasks={world_size} --ntasks-per-node={gpus_per_node} "
+                    "--gpus-per-task=1 --gpu-bind=closest "
+                    f'--nodelist="$CLIENT_{client_id}_NODES" '
+                    f'env OMNIFED_ROLE=client '
+                    f'CLIENT_ID={client_id} '
+                    f'FEDERATED_RANK={client_id + 1} '
+                    f'CLIENT_LEADER_RANK={leader_rank} '
+                    f'CLIENT_MASTER_ADDR="$CLIENT_{client_id}_MASTER" '
+                    f'CLIENT_MASTER_PORT={port_base + client_id} '
+                    f'SERVER_ADDR="$SERVER_HOST" '
+                    f'CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_{client_id}" '
+                    '"$PYEXE" -u -m src.omnifed.slurm_worker '
+                    '--cfg-json "$CFG_JSON" &'
+                ),
+            ]
+
+        lines += [
+            "wait",
+            'echo "All Torchtitan subclusters completed"',
+        ]
+
+        script_path = os.path.join(
+            sconf.work_dir, "omnifed_torchtitan_slurm.sh"
+        )
+
+        with open(script_path, "w") as file:
+            file.write("\n".join(lines) + "\n")
+
+        os.chmod(script_path, 0o755)
+        response = subprocess.check_output(
+            ["sbatch", script_path], text=True
+        ).strip()
+        print(response)
+        raise SystemExit(0)

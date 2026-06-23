@@ -29,6 +29,7 @@ from .communicator import AggregationOp, BaseCommunicator, BaseCommunicatorConfi
 from .data import DataModule, DataModuleConfig
 from .model import ModelConfig
 from .utils import RequiredSetup, print
+from .trainer import create_backend
 
 
 @dataclass
@@ -223,6 +224,8 @@ class Node(RequiredSetup):
         ray_actor_options: RayActorConfig,
         log_dir_base: str,
         device_hint: str,
+        backend_name: Optional[str] = None,
+        backend_cfg: Optional[Any] = None,
     ):
         """
         Initialize federated learning node with configs.
@@ -258,6 +261,11 @@ class Node(RequiredSetup):
         self.datamodule: DataModule = instantiate(datamodule)
         # Deferred instantiation
         self.__device: Optional[torch.device] = None
+
+        self.backend_name: Optional[str] = backend_name
+        self.backend_cfg: Optional[Any] = backend_cfg
+        self.torchtitan_backend: Any = None
+        self.use_torchtitan_backend: bool = False
 
     def _setup(self, total_rounds: int) -> None:
         """
@@ -325,6 +333,21 @@ class Node(RequiredSetup):
             int(group_max_epochs_and_iters["epochs_per_round"].item()),
             total_rounds,
         )
+
+        if self.backend_name == "torchtitan":
+            torchtitan_cfg = getattr(self.backend_cfg, "torchtitan", None)
+
+            torchtitan_backend = create_backend(
+                cfg=self.backend_cfg,
+                backend_name=self.backend_name,
+                module=getattr(torchtitan_cfg, "module", None) if torchtitan_cfg is not None else None,
+                config_name=getattr(torchtitan_cfg, "config_name", None) if torchtitan_cfg is not None else None,
+                output_dir=getattr(torchtitan_cfg, "output_dir", None) if torchtitan_cfg is not None else None,
+                update_dir=getattr(torchtitan_cfg, "update_dir", None) if torchtitan_cfg is not None else None,
+            )
+
+            self.algorithm.use_torchtitan_backend = True
+            self.algorithm.torchtitan_backend = torchtitan_backend
 
         _t_init_total_end = time.time()
 

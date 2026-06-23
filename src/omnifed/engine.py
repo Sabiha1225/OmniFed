@@ -49,6 +49,8 @@ from omegaconf import OmegaConf
 from .slurm_launcher import SlurmConfig, SlurmOnlyLauncher
 import sys
 
+from .trainer import create_backend
+
 LOG_FLUSH_DELAY = 2.0
 
 
@@ -184,6 +186,14 @@ class Engine(RequiredSetup):
 
         self._ray_actor_refs: List[Node] = []
 
+        self.backend_name = "torchdist"
+        self.backend_cfg = None
+
+        backend_cfg = getattr(cfg, "backend", None)
+        if backend_cfg is not None:
+            self.backend_name = getattr(backend_cfg, "internal_backend", "torchdist")
+            self.backend_cfg = cfg
+
     def _setup_output_directories(self) -> None:
         """
         Create and validate output directories for experiment data.
@@ -262,6 +272,13 @@ class Engine(RequiredSetup):
             default_datamodule_cfg=self.cfg.datamodule,
         )
 
+        backend_cfg = getattr(self.cfg, "backend", None)
+        if backend_cfg is not None:
+            self.backend_name = getattr(backend_cfg, "internal_backend", "torchdist")
+            self.backend_cfg = self.cfg
+        
+        os.environ["OMNIFED_INTERNAL_BACKEND"] = self.backend_name
+
         mode = (self.cfg.engine or {}).get("mode", "ray").lower()
         if mode not in ("ray", "slurm"):
             raise ValueError(f"engine.mode must be 'ray' or 'slurm', got {mode!r}")
@@ -277,6 +294,8 @@ class Engine(RequiredSetup):
                     "cfg": OmegaConf.to_container(self.cfg, resolve=True),
                     "hydra_output_dir": self.hydra_cfg.runtime.output_dir,
                     "slurm_checkpoint_dir": ckpt_dir,
+                    "backend": OmegaConf.to_container(getattr(self.cfg, "backend", {}), resolve=True),
+                    "torchtitan": OmegaConf.to_container(getattr(self.cfg, "torchtitan", {}), resolve=True),
                 }
                 os.makedirs(outputs_root, exist_ok=True)
                 with open(cfg_json_shared, "w") as f:
@@ -351,8 +370,40 @@ class Engine(RequiredSetup):
                     '"$PYEXE" --version',
                 ]
 
+                subclusters = getattr(self.cfg.torchtitan, "subclusters", None)
+                use_subclusters = (
+                    self.backend_name == "torchtitan"
+                    and subclusters is not None
+                    and subclusters.enabled
+                )
+
                 # Submit & exit parent; Slurm tasks will run slurm_worker.py
-                SlurmOnlyLauncher.submit_or_exit(sconf)
+                # SlurmOnlyLauncher.submit_or_exit(sconf)
+
+                if use_subclusters:
+                    from .slurm_launcher import SlurmTorchTitanLauncher
+
+                    gpus_per_node = int(subclusters.gpus_per_node)
+                    sconf.nodes = (
+                        1
+                        + int(subclusters.num_clients)
+                        * int(subclusters.nodes_per_client)
+                    )
+                    sconf.ntasks = None
+                    sconf.ntasks_per_node = gpus_per_node
+                    sconf.gpus_per_node = gpus_per_node
+                    sconf.gpus_per_task = None
+                    sconf.gres = None
+
+                    SlurmTorchTitanLauncher.submit_or_exit(
+                        sconf=sconf,
+                        subcluster_cfg=OmegaConf.to_container(subclusters, resolve=True),
+                    )
+                else:
+                    # Existing ordinary Omnifed behavior.
+                    sconf.ntasks = len(list(self.topology))
+                    SlurmOnlyLauncher.submit_or_exit(sconf)
+
                 return
             else:
                 print("[Engine] Inside Slurm allocation; slurm_worker.py handles execution.")
@@ -494,6 +545,8 @@ class Engine(RequiredSetup):
 
             node_actor = Node.options(**node_config.ray_actor_options).remote(
                 **node_config,  # type: ignore[call-arg]
+                backend_name=self.backend_name,
+                backend_cfg=self.backend_cfg,
             )
             ray_actor_refs.append(node_actor)
 

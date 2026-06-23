@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, json, os, signal, time, subprocess, pickle, warnings
 from typing import Any, Dict, Optional
 import numpy as np
-from dataclasses import is_dataclass, asdict
+from dataclasses import is_dataclass, asdict, dataclass
 import csv
 
 from hydra.utils import instantiate
@@ -17,6 +17,157 @@ from src.omnifed.utils import print  # pretty printer used elsewhere
 
 import threading
 from datetime import datetime
+
+from src.omnifed.trainer import create_backend
+from pathlib import Path
+from src.omnifed.communicator.grpc import GrpcCommunicator
+import shutil
+
+
+@dataclass(frozen=True)
+class SlurmRole:
+    role: str
+    federated_rank: int
+    client_id: int | None
+    torchtitan_rank: int | None
+    torchtitan_world_size: int | None
+    is_client_leader: bool
+
+# def resolve_subcluster_role(cfg) -> SlurmRole:
+#     allocation_node_id = int(os.environ["SLURM_NODEID"])
+#     local_rank = int(os.environ.get("SLURM_LOCALID", "0"))
+
+#     nodes_per_client = int(cfg.torchtitan.subclusters.nodes_per_client)
+#     gpus_per_node = int(cfg.torchtitan.subclusters.gpus_per_node)
+#     leader_rank = int(cfg.torchtitan.subclusters.leader_rank)
+
+#     # First allocation node is automatically the Omnifed server.
+#     if allocation_node_id == 0:
+#         return SlurmRole(
+#             role="server",
+#             federated_rank=0,
+#             client_id=None,
+#             torchtitan_rank=None,
+#             torchtitan_world_size=None,
+#             is_client_leader=False,
+#         )
+
+#     client_node_index = allocation_node_id - 1
+#     client_id = client_node_index // nodes_per_client
+#     node_rank_inside_client = client_node_index % nodes_per_client
+
+#     torchtitan_rank = node_rank_inside_client * gpus_per_node + local_rank
+#     torchtitan_world_size = nodes_per_client * gpus_per_node
+
+#     return SlurmRole(
+#         role="client",
+#         federated_rank=client_id + 1,
+#         client_id=client_id,
+#         torchtitan_rank=torchtitan_rank,
+#         torchtitan_world_size=torchtitan_world_size,
+#         is_client_leader=torchtitan_rank == leader_rank,
+#     )
+
+
+def resolve_subcluster_role(cfg) -> SlurmRole:
+    role = os.environ["OMNIFED_ROLE"]
+
+    if role == "server":
+        return SlurmRole(
+            role="server",
+            federated_rank=0,
+            client_id=None,
+            torchtitan_rank=None,
+            torchtitan_world_size=None,
+            is_client_leader=False,
+        )
+
+    client_id = int(os.environ["CLIENT_ID"])
+
+    # Automatically provided by Slurm for this client srun step.
+    torchtitan_rank = int(os.environ["SLURM_PROCID"])
+    torchtitan_world_size = int(os.environ["SLURM_NTASKS"])
+
+    leader_rank = int(cfg.torchtitan.subclusters.leader_rank)
+
+    return SlurmRole(
+        role="client",
+        federated_rank=client_id + 1,
+        client_id=client_id,
+        torchtitan_rank=torchtitan_rank,
+        torchtitan_world_size=torchtitan_world_size,
+        is_client_leader=torchtitan_rank == leader_rank,
+    )
+
+def create_federated_communicator(cfg, federated_rank: int, server_addr: str):
+    communicator = GrpcCommunicator(
+        rank=federated_rank,
+        world_size=int(cfg.torchtitan.subclusters.num_clients) + 1,
+        master_addr=server_addr,
+        master_port=int(cfg.torchtitan.federated.server_port),
+        max_send_message_length=128 * 1024 * 1024,
+        max_receive_message_length=128 * 1024 * 1024,
+        aggregation_timeout=float(
+            cfg.torchtitan.federated.aggregation_timeout
+        ),
+        client_timeout=float(
+            cfg.torchtitan.federated.aggregation_timeout
+        ),
+    )
+    communicator.setup()
+    return communicator
+
+# This chunks by parameter. If a single parameter exceeds 
+# the gRPC message limit, that tensor must additionally be sliced or the gRPC limit increased.
+def iter_state_chunks(state_dict, chunk_size_mb: int):
+    limit = chunk_size_mb * 1024 * 1024
+    chunk = {}
+    chunk_bytes = 0
+
+    for name in sorted(state_dict):
+        tensor = state_dict[name].detach().cpu()
+
+        if tensor.is_floating_point():
+            tensor = tensor.float()
+        
+        tensor_bytes = tensor.numel() * tensor.element_size()
+
+        if chunk and chunk_bytes + tensor_bytes > limit:
+            yield chunk
+            chunk = {}
+            chunk_bytes = 0
+
+        chunk[name] = tensor
+        chunk_bytes += tensor_bytes
+
+    if chunk:
+        yield chunk
+
+def get_initial_model_paths(cfg) -> tuple[Path, Path]:
+    initial_path = (
+        Path(cfg.torchtitan.subclusters.checkpoint_root)
+        / f"job_{os.environ['SLURM_JOB_ID']}"
+        / "initial"
+        / "model.pt"
+    )
+    ready_path = initial_path.with_suffix(".ready")
+    return initial_path, ready_path
+
+
+def wait_for_file(
+    path: Path,
+    timeout: float = 1800,
+    interval: float = 2.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for {path}"
+            )
+        time.sleep(interval)
+
 
 def _first_host_from_nodelist() -> str:
     out = subprocess.check_output(
@@ -195,6 +346,243 @@ def log_gpu_memory_snapshot(rank: int, log_path: str, tag: str):
         pass
 
 
+def run_client_global_communication(
+    cfg,
+    communicator,
+    result,
+):
+    payload = torch.load(
+        result["checkpoint_path"],
+        map_location="cpu",
+    )
+
+    local_state = payload["model"]
+    local_tokens = float(payload["num_tokens"])
+
+    total_tokens = communicator.aggregate(
+        torch.tensor([local_tokens], dtype=torch.float64),
+        AggregationOp.SUM,
+    ).item()
+
+    weight = local_tokens / max(total_tokens, 1.0)
+    aggregated_state = {}
+
+    chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
+
+    for chunk in iter_state_chunks(local_state, chunk_size):
+        weighted_chunk = {
+            name: tensor * weight
+            for name, tensor in chunk.items()
+        }
+
+        result_chunk = communicator.aggregate(
+            weighted_chunk,
+            AggregationOp.SUM,
+        )
+        aggregated_state.update(result_chunk)
+
+    return aggregated_state
+
+def run_torchtitan_client(cfg, role: SlurmRole) -> None:
+    os.environ["RANK"] = str(role.torchtitan_rank)
+    os.environ["WORLD_SIZE"] = str(role.torchtitan_world_size)
+    os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
+    os.environ["MASTER_ADDR"] = os.environ["CLIENT_MASTER_ADDR"]
+    os.environ["MASTER_PORT"] = os.environ["CLIENT_MASTER_PORT"]
+    os.environ["CLIENT_ID"] = str(role.client_id)
+    os.environ["CLIENT_LEADER_RANK"] = str(
+        cfg.torchtitan.subclusters.leader_rank
+    )
+
+    checkpoint_root = Path(os.environ["CLIENT_CHECKPOINT_ROOT"])
+
+    backend = create_backend(
+        cfg=cfg,
+        backend_name="torchtitan",
+    )
+
+    communicator = None
+    if role.is_client_leader:
+        communicator = create_federated_communicator(
+            cfg=cfg,
+            federated_rank=role.federated_rank,
+            server_addr=os.environ["SERVER_ADDR"],
+        )
+
+    initial_path, initial_ready_path = get_initial_model_paths(cfg)
+
+    try:
+        # Client 0 collectively creates the initial TorchTitan model.
+        if role.client_id == 0:
+            initial_result = backend.save_and_consolidate(
+                round_id=-1,
+                num_tokens=0,
+            )
+
+            if role.is_client_leader:
+                initial_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                temporary_path = initial_path.with_suffix(".tmp")
+
+                shutil.copyfile(
+                    initial_result["checkpoint_path"],
+                    temporary_path,
+                )
+                os.replace(temporary_path, initial_path)
+
+                # Publish only after model.pt is completely written.
+                initial_ready_path.touch()
+
+        # Other clients wait for client 0 to publish the model.
+        wait_for_file(initial_ready_path)
+
+        # Every rank within this subcluster reaches this point.
+        dist.barrier()
+
+        # Load initial ordinary tensors into this client's PP/TP model.
+        backend.load_global_model(
+            model_path=str(initial_path),
+            round_id=-1,
+        )
+
+        dist.barrier()
+
+        # Federated rounds.
+        for round_id in range(int(cfg.global_rounds)):
+            train_result = backend.train_local_steps(
+                steps=int(cfg.torchtitan.federated.local_steps)
+            )
+
+            local_result = backend.save_and_consolidate(
+                round_id=round_id,
+                num_tokens=int(train_result["num_tokens"]),
+            )
+
+            global_path = (
+                checkpoint_root
+                / f"round_{round_id}"
+                / "global_model.pt"
+            )
+
+            if role.is_client_leader:
+                assert communicator is not None
+
+                aggregated_state = run_client_global_communication(
+                    cfg=cfg,
+                    communicator=communicator,
+                    result=local_result,
+                )
+
+                global_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                temporary_path = global_path.with_suffix(".tmp")
+
+                torch.save(
+                    {"model": aggregated_state},
+                    temporary_path,
+                )
+                os.replace(temporary_path, global_path)
+
+            # Wait for this client's leader to finish writing.
+            dist.barrier()
+
+            # Convert global tensors back into PP/TP DTensors.
+            backend.load_global_model(
+                model_path=str(global_path),
+                round_id=round_id,
+            )
+
+            dist.barrier()
+
+    finally:
+        if communicator is not None:
+            communicator.close()
+
+        backend.close()
+
+# def run_federated_server(cfg, role: SlurmRole) -> None:
+#     assert role.federated_rank == 0
+
+#     num_clients = int(cfg.torchtitan.subclusters.num_clients)
+
+#     server = CheckpointAggregationServer(
+#         num_clients=num_clients,
+#         checkpoint_root=cfg.torchtitan.subclusters.checkpoint_root,
+#         port=int(cfg.torchtitan.federated.server_port),
+#     )
+
+#     server.run(global_rounds=int(cfg.global_rounds))
+
+
+def run_federated_server(cfg, role: SlurmRole) -> None:
+    server_addr = subprocess.check_output(
+        ["hostname"], text=True
+    ).strip()
+
+    communicator = create_federated_communicator(
+        cfg=cfg,
+        federated_rank=0,
+        server_addr=server_addr,
+    )
+
+    initial_path, initial_ready_path = get_initial_model_paths(cfg)
+
+    wait_for_file(initial_ready_path)
+
+    initial = torch.load(
+        initial_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    global_state = initial.get("model", initial)
+
+    chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
+
+    for round_id in range(int(cfg.global_rounds)):
+        # Make the current global state available to client leaders.
+        # communicator.broadcast(global_state)
+
+        # Server participates with zero samples and zero-valued tensors.
+        communicator.aggregate(
+            torch.tensor([0.0], dtype=torch.float64),
+            AggregationOp.SUM,
+        )
+
+        new_global_state = {}
+
+        for chunk in iter_state_chunks(global_state, chunk_size):
+            zero_chunk = {
+                name: torch.zeros_like(tensor)
+                for name, tensor in chunk.items()
+            }
+
+            aggregated_chunk = communicator.aggregate(
+                zero_chunk,
+                AggregationOp.SUM,
+            )
+            new_global_state.update(aggregated_chunk)
+
+        global_state = new_global_state
+
+        output = (
+            Path(cfg.torchtitan.subclusters.checkpoint_root)
+            / f"job_{os.environ['SLURM_JOB_ID']}"
+            / "server"
+            / f"round_{round_id}"
+            / "model.pt"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": global_state}, output)
+
+    communicator.close()
+
+
 def main():
     # ---------- args & frozen config ----------
     p = argparse.ArgumentParser()
@@ -208,6 +596,18 @@ def main():
     hydra_out_dir = raw["hydra_output_dir"]
     ckpt_dir = raw.get("slurm_checkpoint_dir") or os.path.join(hydra_out_dir, "engine", "ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
+
+    subclusters = getattr(cfg.torchtitan, "subclusters", None)
+
+    if subclusters is not None and subclusters.enabled:
+        role = resolve_subcluster_role(cfg)
+
+        if role.role == "server":
+            run_federated_server(cfg, role)
+        else:
+            run_torchtitan_client(cfg, role)
+
+        return
 
     # ---------- Slurm sizing & env ----------
     rank  = int(os.environ.get("SLURM_PROCID", "0"))
@@ -275,6 +675,19 @@ def main():
     model       = instantiate(cfg.model)
     datamodule  = instantiate(cfg.datamodule)
     algorithm   = instantiate(node_cfg.algorithm, log_dir=node_log_dir)
+
+    algorithm.use_torchtitan_backend = (
+        os.environ.get("OMNIFED_INTERNAL_BACKEND", "torchdist") == "torchtitan"
+    )
+    if algorithm.use_torchtitan_backend:
+        algorithm.torchtitan_backend = create_backend(
+            cfg=cfg,
+            backend_name="torchtitan",
+            module=getattr(cfg, "torchtitan", None).module if getattr(cfg, "torchtitan", None) is not None else None,
+            config_name=getattr(cfg, "torchtitan", None).config_name if getattr(cfg, "torchtitan", None) is not None else None,
+            output_dir=getattr(cfg, "torchtitan", None).output_dir if getattr(cfg, "torchtitan", None) is not None else None,
+            update_dir=getattr(cfg, "torchtitan", None).update_dir if getattr(cfg, "torchtitan", None) is not None else None,
+        )
 
     # ---------- Device selection ----------
     # If communicator backend is NCCL, we must put tensors on CUDA before collectives.
