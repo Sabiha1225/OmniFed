@@ -137,11 +137,41 @@ class TorchTitanBackend:
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        args = [f"--module={config_spec['module']}", f"--config={config_spec['config_name']}"]
+        def _to_tyro_key(key: str) -> str:
+            return ".".join(part.replace("_", "-") for part in key.split("."))
+
+        def _to_tyro_false_bool_key(key: str) -> str:
+            key = _to_tyro_key(key)
+            if "." not in key:
+                return f"no-{key}"
+
+            prefix, name = key.rsplit(".", 1)
+            return f"{prefix}.no-{name}"
+
+        args = [
+            f"--module={config_spec['module']}",
+            f"--config={config_spec['config_name']}",
+        ]
+
+        if config_spec.get("hf_assets_path"):
+            args.append(f"--hf-assets-path={config_spec['hf_assets_path']}")
+
+        if config_spec.get("dataset_path"):
+            args.append(f"--dataloader.dataset-path={config_spec['dataset_path']}")
+
         for key, value in (config_spec["overrides"] or {}).items():
-            if isinstance(value, (dict, list, tuple)):
-                value = json.dumps(value)
-            args.append(f"--{key}={value}")
+            if isinstance(value, bool):
+                if value:
+                    args.append(f"--{_to_tyro_key(key)}")
+                else:
+                    args.append(f"--{_to_tyro_false_bool_key(key)}")
+            else:
+                if isinstance(value, (dict, list, tuple)):
+                    value = json.dumps(value)
+                args.append(f"--{_to_tyro_key(key)}={value}")
+
+        print(f"[TorchTitanBackend] TorchTitan args: {args}")
+
 
         config_manager = ConfigManager()
         config = config_manager.parse_args(args=args)
@@ -340,6 +370,9 @@ class TorchTitanBackend:
         dcp_step_path = distributed_root / "step-0"
         flat_model_path = round_root / "global_flat_model.pt"
 
+        round_root.mkdir(parents=True, exist_ok=True)
+        distributed_root.mkdir(parents=True, exist_ok=True)
+
         if rank == leader_rank:
             payload = torch.load(
                 model_path,
@@ -379,6 +412,19 @@ class TorchTitanBackend:
         dist.barrier()
 
     
+    # def close(self) -> None:
+    #    self._trainer = None
+    #    self._config = None
+
+
+
     def close(self) -> None:
-        self._trainer = None
-        self._config = None
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+                dist.destroy_process_group()
+        except Exception as exc:
+            print(f"[TorchTitanBackend.close] distributed cleanup warning: {exc}", flush=True)
+        finally:
+            self._trainer = None
+            self._config = None

@@ -196,3 +196,7 @@ ignored*/
 outputs*/
 
 datasets/
+
+# Core dumps
+core
+core.*

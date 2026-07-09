@@ -1,3 +1,4 @@
+
 # src/omnifed/slurm_worker.py
 from __future__ import annotations
 import argparse, json, os, signal, time, subprocess, pickle, warnings
@@ -152,6 +153,11 @@ def get_initial_model_paths(cfg) -> tuple[Path, Path]:
     )
     ready_path = initial_path.with_suffix(".ready")
     return initial_path, ready_path
+
+
+def maybe_dist_barrier() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 def wait_for_file(
@@ -387,6 +393,7 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
     os.environ["RANK"] = str(role.torchtitan_rank)
     os.environ["WORLD_SIZE"] = str(role.torchtitan_world_size)
     os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
+    # os.environ["LOCAL_RANK"] = "0"
     os.environ["MASTER_ADDR"] = os.environ["CLIENT_MASTER_ADDR"]
     os.environ["MASTER_PORT"] = os.environ["CLIENT_MASTER_PORT"]
     os.environ["CLIENT_ID"] = str(role.client_id)
@@ -440,7 +447,7 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
         wait_for_file(initial_ready_path)
 
         # Every rank within this subcluster reaches this point.
-        dist.barrier()
+        # dist.barrier()
 
         # Load initial ordinary tensors into this client's PP/TP model.
         backend.load_global_model(
@@ -448,7 +455,8 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
             round_id=-1,
         )
 
-        dist.barrier()
+        # dist.barrier()
+        maybe_dist_barrier()
 
         # Federated rounds.
         for round_id in range(int(cfg.global_rounds)):
@@ -466,6 +474,8 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
                 / f"round_{round_id}"
                 / "global_model.pt"
             )
+
+            global_ready_path = global_path.with_suffix(".ready")
 
             if role.is_client_leader:
                 assert communicator is not None
@@ -487,10 +497,19 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
                     {"model": aggregated_state},
                     temporary_path,
                 )
+
+                # Atomic publish: model.pt appears only after the full file is written.
                 os.replace(temporary_path, global_path)
 
+                # Signal non-leader ranks that this round's global model is ready.
+                global_ready_path.touch()
+
+            # Non-leader ranks wait through Lustre, not raw dist.barrier().
+            wait_for_file(global_ready_path)
+
             # Wait for this client's leader to finish writing.
-            dist.barrier()
+            # dist.barrier()
+            # maybe_dist_barrier()
 
             # Convert global tensors back into PP/TP DTensors.
             backend.load_global_model(
@@ -498,9 +517,16 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
                 round_id=round_id,
             )
 
-            dist.barrier()
+            # dist.barrier()
+            maybe_dist_barrier()
 
     finally:
+
+        try:
+            maybe_dist_barrier()
+        except Exception:
+            pass
+
         if communicator is not None:
             communicator.close()
 

@@ -176,6 +176,7 @@ class SlurmOnlyLauncher:
         print(f"[SlurmOnlyLauncher] sbatch response: {out}")
         raise SystemExit(0)
 
+
 class SlurmTorchTitanLauncher:
     @staticmethod
     def submit_or_exit(sconf: SlurmConfig, subcluster_cfg: dict) -> None:
@@ -188,8 +189,36 @@ class SlurmTorchTitanLauncher:
         port_base = int(subcluster_cfg["master_port_base"])
 
         pyexe = sconf.pyexe or "python"
-
         leader_rank = int(subcluster_cfg["leader_rank"])
+
+        #worker_entrypoint = (
+        #    "bash -lc '"
+        #    'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ]; then '
+        #    'export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; '
+        #    'unset ROCR_VISIBLE_DEVICES; '
+        #    'fi; '
+        #    'echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; '
+        #    'exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"'
+        #    "'"
+        #)
+
+        worker_entrypoint = (
+            "bash -lc "
+            + shlex.quote(
+                'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then '
+                'export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; '
+                'fi; '
+                'unset ROCR_VISIBLE_DEVICES; '
+                'export HF_HOME="/mnt/bb/sabiha/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; '
+                'export HF_DATASETS_CACHE="${HF_HOME}/datasets"; '
+                'export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; '
+                'mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; '
+                'echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; '
+                'echo "HF_HOME=$HF_HOME"; '
+                'echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; '
+                'exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"'
+            )
+        )
 
         lines = ["#!/bin/bash"]
         lines += sconf.sbatch_lines()
@@ -200,10 +229,10 @@ class SlurmTorchTitanLauncher:
 
         lines += [
             f'export PYTHONPATH="{sconf.work_dir}:${{PYTHONPATH:-}}"',
-            'PYEXE="${PYEXE:-python}"',
+            f'export PYEXE="${{PYEXE:-{pyexe}}}"',
             'mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")',
             'SERVER_HOST="${HOSTS[0]}"',
-            f'CFG_JSON="{sconf.cfg_json_path}"',
+            f'export CFG_JSON="{sconf.cfg_json_path}"',
             f'CHECKPOINT_ROOT="{checkpoint_root}/job_${{SLURM_JOB_ID}}"',
             'mkdir -p "$CHECKPOINT_ROOT"',
             "",
@@ -212,13 +241,11 @@ class SlurmTorchTitanLauncher:
             'env OMNIFED_ROLE=server '
             'FEDERATED_RANK=0 '
             'CHECKPOINT_ROOT="$CHECKPOINT_ROOT" '
-            '"$PYEXE" -u -m src.omnifed.slurm_worker '
-            '--cfg-json "$CFG_JSON" &',
+            f'{worker_entrypoint} &',
         ]
 
         for client_id in range(num_clients):
             first_node = 1 + client_id * nodes_per_client
-            last_node = first_node + nodes_per_client - 1
             world_size = nodes_per_client * gpus_per_node
 
             lines += [
@@ -227,7 +254,7 @@ class SlurmTorchTitanLauncher:
                 (
                     f"srun --exclusive --nodes={nodes_per_client} "
                     f"--ntasks={world_size} --ntasks-per-node={gpus_per_node} "
-                    "--gpus-per-task=1 --gpu-bind=closest "
+                    #"--gpus-per-task=1 --gpu-bind=closest "
                     f'--nodelist="$CLIENT_{client_id}_NODES" '
                     f'env OMNIFED_ROLE=client '
                     f'CLIENT_ID={client_id} '
@@ -237,8 +264,7 @@ class SlurmTorchTitanLauncher:
                     f'CLIENT_MASTER_PORT={port_base + client_id} '
                     f'SERVER_ADDR="$SERVER_HOST" '
                     f'CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_{client_id}" '
-                    '"$PYEXE" -u -m src.omnifed.slurm_worker '
-                    '--cfg-json "$CFG_JSON" &'
+                    f'{worker_entrypoint} &'
                 ),
             ]
 
