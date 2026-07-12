@@ -1,17 +1,18 @@
 #!/bin/bash
 #SBATCH --job-name=omnifed_titan_grpc
 #SBATCH --nodes=5
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=8
 #SBATCH --time=01:55:00
 #SBATCH --signal=B:USR1@180
 #SBATCH -C nvme
+#SBATCH --exclusive
 #SBATCH --account=GEN150
 #SBATCH --partition=batch
-#SBATCH -o /autofs/nccs-svm1_home2/sabiha/omnifed-titan/outputs/2026-07-03/test_fedavg_centralized_torchdist/slurm-%j.out
-#SBATCH -e /autofs/nccs-svm1_home2/sabiha/omnifed-titan/outputs/2026-07-03/test_fedavg_centralized_torchdist/slurm-%j.err
+#SBATCH -o /autofs/nccs-svm1_home2/sabiha/omnifed-titan/outputs/2026-07-11/test_fedavg_centralized_torchdist/slurm-%j.out
+#SBATCH -e /autofs/nccs-svm1_home2/sabiha/omnifed-titan/outputs/2026-07-11/test_fedavg_centralized_torchdist/slurm-%j.err
 #SBATCH --chdir=/autofs/nccs-svm1_home2/sabiha/omnifed-titan
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=8
 set -euo pipefail
 module load PrgEnv-gnu/8.6.0
 module load rocm/6.4.1
@@ -70,9 +71,9 @@ mkdir -p "$CHECKPOINT_ROOT"
 srun --exclusive --nodes=1 --ntasks=1 --nodelist="$SERVER_HOST" env OMNIFED_ROLE=server FEDERATED_RANK=0 CHECKPOINT_ROOT="$CHECKPOINT_ROOT" bash -lc 'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; fi; unset ROCR_VISIBLE_DEVICES; export HF_HOME="/mnt/bb/sabiha/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; export HF_DATASETS_CACHE="${HF_HOME}/datasets"; export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; echo "HF_HOME=$HF_HOME"; echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"' &
 CLIENT_0_NODES=$(IFS=,; echo "${HOSTS[*]:1:2}")
 CLIENT_0_MASTER="${HOSTS[1]}"
-srun --exclusive --nodes=2 --ntasks=8 --ntasks-per-node=4 --nodelist="$CLIENT_0_NODES" env OMNIFED_ROLE=client CLIENT_ID=0 FEDERATED_RANK=1 CLIENT_LEADER_RANK=0 CLIENT_MASTER_ADDR="$CLIENT_0_MASTER" CLIENT_MASTER_PORT=29600 SERVER_ADDR="$SERVER_HOST" CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_0" bash -lc 'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; fi; unset ROCR_VISIBLE_DEVICES; export HF_HOME="/mnt/bb/sabiha/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; export HF_DATASETS_CACHE="${HF_HOME}/datasets"; export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; echo "HF_HOME=$HF_HOME"; echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"' &
+srun --exclusive --nodes=2 --ntasks=16 --ntasks-per-node=8 --nodelist="$CLIENT_0_NODES" env OMNIFED_ROLE=client CLIENT_ID=0 FEDERATED_RANK=1 CLIENT_LEADER_RANK=0 CLIENT_MASTER_ADDR="$CLIENT_0_MASTER" CLIENT_MASTER_PORT=29600 SERVER_ADDR="$SERVER_HOST" CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_0" bash -lc 'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; fi; unset ROCR_VISIBLE_DEVICES; export HF_HOME="/mnt/bb/sabiha/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; export HF_DATASETS_CACHE="${HF_HOME}/datasets"; export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; echo "HF_HOME=$HF_HOME"; echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"' &
 CLIENT_1_NODES=$(IFS=,; echo "${HOSTS[*]:3:2}")
 CLIENT_1_MASTER="${HOSTS[3]}"
-srun --exclusive --nodes=2 --ntasks=8 --ntasks-per-node=4 --nodelist="$CLIENT_1_NODES" env OMNIFED_ROLE=client CLIENT_ID=1 FEDERATED_RANK=2 CLIENT_LEADER_RANK=0 CLIENT_MASTER_ADDR="$CLIENT_1_MASTER" CLIENT_MASTER_PORT=29601 SERVER_ADDR="$SERVER_HOST" CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_1" bash -lc 'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; fi; unset ROCR_VISIBLE_DEVICES; export HF_HOME="/mnt/bb/sabiha/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; export HF_DATASETS_CACHE="${HF_HOME}/datasets"; export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; echo "HF_HOME=$HF_HOME"; echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"' &
+srun --exclusive --nodes=2 --ntasks=16 --ntasks-per-node=8 --nodelist="$CLIENT_1_NODES" env OMNIFED_ROLE=client CLIENT_ID=1 FEDERATED_RANK=2 CLIENT_LEADER_RANK=0 CLIENT_MASTER_ADDR="$CLIENT_1_MASTER" CLIENT_MASTER_PORT=29601 SERVER_ADDR="$SERVER_HOST" CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_1" bash -lc 'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; fi; unset ROCR_VISIBLE_DEVICES; export HF_HOME="/mnt/bb/sabiha/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; export HF_DATASETS_CACHE="${HF_HOME}/datasets"; export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; echo "HF_HOME=$HF_HOME"; echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; exec "$PYEXE" -u -m src.omnifed.slurm_worker --cfg-json "$CFG_JSON"' &
 wait
 echo "All Torchtitan subclusters completed"
