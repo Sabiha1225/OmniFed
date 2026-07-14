@@ -24,6 +24,9 @@ from pathlib import Path
 from src.omnifed.communicator.grpc import GrpcCommunicator
 import shutil
 
+from src.omnifed.timing import TimingRecorder
+
+from contextlib import nullcontext
 
 @dataclass(frozen=True)
 class SlurmRole:
@@ -352,39 +355,56 @@ def log_gpu_memory_snapshot(rank: int, log_path: str, tag: str):
         pass
 
 
+# def run_client_global_communication(
+#     cfg,
+#     communicator,
+#     result,
+# ):
+
 def run_client_global_communication(
     cfg,
     communicator,
     result,
+    timer=None,
+    round_id=None,
 ):
-    payload = torch.load(
-        result["checkpoint_path"],
-        map_location="cpu",
-    )
+
+    with timer.measure("client_load_consolidated_tensor_checkpoint", round_id) if timer else nullcontext():
+        payload = torch.load(
+            result["checkpoint_path"],
+            map_location="cpu",
+        )
 
     local_state = payload["model"]
     local_tokens = float(payload["num_tokens"])
 
-    total_tokens = communicator.aggregate(
-        torch.tensor([local_tokens], dtype=torch.float64),
-        AggregationOp.SUM,
-    ).item()
+    with timer.measure("grpc_client_token_count_aggregation", round_id) if timer else nullcontext():
+        total_tokens = communicator.aggregate(
+            torch.tensor([local_tokens], dtype=torch.float64),
+            AggregationOp.SUM,
+        ).item()
 
     weight = local_tokens / max(total_tokens, 1.0)
     aggregated_state = {}
 
     chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
 
-    for chunk in iter_state_chunks(local_state, chunk_size):
+    # for chunk in iter_state_chunks(local_state, chunk_size):
+    for chunk_id, chunk in enumerate(iter_state_chunks(local_state, chunk_size)):
         weighted_chunk = {
             name: tensor * weight
             for name, tensor in chunk.items()
         }
 
-        result_chunk = communicator.aggregate(
-            weighted_chunk,
-            AggregationOp.SUM,
-        )
+        with timer.measure(
+            "grpc_client_send_wait_receive_model_chunk",
+            round_id,
+            extra=f"chunk_id={chunk_id},num_tensors={len(weighted_chunk)}",
+        ) if timer else nullcontext():
+            result_chunk = communicator.aggregate(
+                weighted_chunk,
+                AggregationOp.SUM,
+            )
         aggregated_state.update(result_chunk)
 
     return aggregated_state
@@ -402,11 +422,18 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
     )
 
     checkpoint_root = Path(os.environ["CLIENT_CHECKPOINT_ROOT"])
+    
+    timer = TimingRecorder(
+        root=Path(cfg.torchtitan.subclusters.checkpoint_root) / f"job_{os.environ['SLURM_JOB_ID']}",
+        role="client",
+        rank=role.torchtitan_rank,
+    )
 
     backend = create_backend(
         cfg=cfg,
         backend_name="torchtitan",
     )
+    backend.timer = timer
 
     communicator = None
     if role.is_client_leader:
@@ -460,14 +487,17 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
 
         # Federated rounds.
         for round_id in range(int(cfg.global_rounds)):
-            train_result = backend.train_local_steps(
-                steps=int(cfg.torchtitan.federated.local_steps)
-            )
+            backend.current_round_id = round_id
+            with timer.measure("torchtitan_local_training_total", round_id):
+                train_result = backend.train_local_steps(
+                    steps=int(cfg.torchtitan.federated.local_steps)
+                )
 
-            local_result = backend.save_and_consolidate(
-                round_id=round_id,
-                num_tokens=int(train_result["num_tokens"]),
-            )
+            with timer.measure("save_sharded_checkpoint_and_consolidate", round_id):
+                local_result = backend.save_and_consolidate(
+                    round_id=round_id,
+                    num_tokens=int(train_result["num_tokens"]),
+                )
 
             global_path = (
                 checkpoint_root
@@ -480,42 +510,52 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
             if role.is_client_leader:
                 assert communicator is not None
 
+                # aggregated_state = run_client_global_communication(
+                #     cfg=cfg,
+                #     communicator=communicator,
+                #     result=local_result,
+                # )
                 aggregated_state = run_client_global_communication(
                     cfg=cfg,
                     communicator=communicator,
                     result=local_result,
+                    timer=timer,
+                    round_id=round_id,
                 )
 
-                global_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
+                with timer.measure("client_write_global_tensor_model", round_id):
+                    global_path.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
 
-                temporary_path = global_path.with_suffix(".tmp")
+                    temporary_path = global_path.with_suffix(".tmp")
 
-                torch.save(
-                    {"model": aggregated_state},
-                    temporary_path,
-                )
+                    torch.save(
+                        {"model": aggregated_state},
+                        temporary_path,
+                    )
 
-                # Atomic publish: model.pt appears only after the full file is written.
-                os.replace(temporary_path, global_path)
+                    # Atomic publish: model.pt appears only after the full file is written.
+                    os.replace(temporary_path, global_path)
 
-                # Signal non-leader ranks that this round's global model is ready.
-                global_ready_path.touch()
+                    # Signal non-leader ranks that this round's global model is ready.
+                    global_ready_path.touch()
 
             # Non-leader ranks wait through Lustre, not raw dist.barrier().
-            wait_for_file(global_ready_path)
+            with timer.measure("client_wait_for_global_model_file", round_id):
+                wait_for_file(global_ready_path)
 
             # Wait for this client's leader to finish writing.
             # dist.barrier()
             # maybe_dist_barrier()
 
             # Convert global tensors back into PP/TP DTensors.
-            backend.load_global_model(
-                model_path=str(global_path),
-                round_id=round_id,
-            )
+            with timer.measure("convert_global_tensor_to_dtensor", round_id):
+                backend.load_global_model(
+                    model_path=str(global_path),
+                    round_id=round_id,
+                )
 
             # dist.barrier()
             maybe_dist_barrier()
@@ -557,16 +597,23 @@ def run_federated_server(cfg, role: SlurmRole) -> None:
         server_addr=server_addr,
     )
 
+    timer = TimingRecorder(
+        root=Path(cfg.torchtitan.subclusters.checkpoint_root) / f"job_{os.environ['SLURM_JOB_ID']}",
+        role="server",
+        rank=0,
+    )
+
     initial_path, initial_ready_path = get_initial_model_paths(cfg)
 
     wait_for_file(initial_ready_path)
 
-    initial = torch.load(
-        initial_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-    global_state = initial.get("model", initial)
+    with timer.measure("server_load_initial_global_model", "initial"):
+        initial = torch.load(
+            initial_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        global_state = initial.get("model", initial)
 
     chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
 
@@ -575,36 +622,44 @@ def run_federated_server(cfg, role: SlurmRole) -> None:
         # communicator.broadcast(global_state)
 
         # Server participates with zero samples and zero-valued tensors.
-        communicator.aggregate(
-            torch.tensor([0.0], dtype=torch.float64),
-            AggregationOp.SUM,
-        )
+        with timer.measure("server_collect_token_counts", round_id):
+            communicator.aggregate(
+                torch.tensor([0.0], dtype=torch.float64),
+                AggregationOp.SUM,
+            )
 
         new_global_state = {}
 
-        for chunk in iter_state_chunks(global_state, chunk_size):
+        # for chunk in iter_state_chunks(global_state, chunk_size):
+        for chunk_id, chunk in enumerate(iter_state_chunks(global_state, chunk_size)):
             zero_chunk = {
                 name: torch.zeros_like(tensor)
                 for name, tensor in chunk.items()
             }
 
-            aggregated_chunk = communicator.aggregate(
-                zero_chunk,
-                AggregationOp.SUM,
-            )
+            with timer.measure(
+                "server_collect_fedavg_and_return_chunk",
+                round_id,
+                extra=f"chunk_id={chunk_id},num_tensors={len(zero_chunk)}",
+            ):
+                aggregated_chunk = communicator.aggregate(
+                    zero_chunk,
+                    AggregationOp.SUM,
+                )
             new_global_state.update(aggregated_chunk)
 
         global_state = new_global_state
 
-        output = (
-            Path(cfg.torchtitan.subclusters.checkpoint_root)
-            / f"job_{os.environ['SLURM_JOB_ID']}"
-            / "server"
-            / f"round_{round_id}"
-            / "model.pt"
-        )
-        output.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model": global_state}, output)
+        with timer.measure("server_save_global_model", round_id):
+            output = (
+                Path(cfg.torchtitan.subclusters.checkpoint_root)
+                / f"job_{os.environ['SLURM_JOB_ID']}"
+                / "server"
+                / f"round_{round_id}"
+                / "model.pt"
+            )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": global_state}, output)
 
     communicator.close()
 

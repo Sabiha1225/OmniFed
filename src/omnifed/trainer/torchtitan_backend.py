@@ -21,6 +21,9 @@ from torch.distributed.checkpoint.format_utils import (
 #     get_model_state_dict,
 # )
 
+from contextlib import nullcontext
+from src.omnifed.timing import measure_torch_collectives
+
 
 
 class TorchTitanBackend:
@@ -40,6 +43,7 @@ class TorchTitanBackend:
         self._overrides = kwargs.pop("overrides", None) or {}
         self._output_dir = kwargs.pop("output_dir", None)
         self._update_dir = kwargs.pop("update_dir", None)
+        self.timer = None
 
     @staticmethod
     def _get_nested(cfg: Any | None, attr: str, default: Any = None) -> Any:
@@ -200,10 +204,24 @@ class TorchTitanBackend:
 
         steps_run = 0
 
-        for _ in range(local_steps):
-            trainer.step += 1
-            trainer.train_step(data_iterator)
-            steps_run += 1
+        # for _ in range(local_steps):
+        #     trainer.step += 1
+        #     trainer.train_step(data_iterator)
+        #     steps_run += 1
+
+        round_id = getattr(self, "current_round_id", "")
+
+        collective_ctx = (
+            measure_torch_collectives(self.timer, round_id)
+            if self.timer is not None
+            else nullcontext()
+        )
+
+        with collective_ctx:
+            for _ in range(local_steps):
+                trainer.step += 1
+                trainer.train_step(data_iterator)
+                steps_run += 1
 
         tokens_this_round = (
             int(trainer.ntokens_seen) - tokens_before
@@ -278,10 +296,11 @@ class TorchTitanBackend:
         trainer.checkpointer.folder = str(distributed_root)
 
         try:
-            saved = trainer.checkpointer.save(
-                trainer.step,
-                last_step=True,
-            )
+            with self.timer.measure("torchtitan_save_sharded_dcp", round_id) if self.timer else nullcontext():
+                saved = trainer.checkpointer.save(
+                    trainer.step,
+                    last_step=True,
+                )
 
             if not saved:
                 raise RuntimeError(
@@ -307,33 +326,35 @@ class TorchTitanBackend:
                     consolidated_path.parent / "flat_model.tmp.pt"
                 )
 
-                dcp_to_torch_save(
-                    str(dcp_path),
-                    str(temporary_flat_path),
-                )
+                with self.timer.measure("leader_dcp_to_normal_tensor", round_id) if self.timer else nullcontext():
+                    dcp_to_torch_save(
+                        str(dcp_path),
+                        str(temporary_flat_path),
+                    )
 
-                flat_state = torch.load(
-                    temporary_flat_path,
-                    map_location="cpu",
-                    weights_only=False,
-                )
+                    flat_state = torch.load(
+                        temporary_flat_path,
+                        map_location="cpu",
+                        weights_only=False,
+                    )
 
                 temporary_path = consolidated_path.with_suffix(
                     ".tmp"
                 )
 
-                torch.save(
-                    {
-                        "model": flat_state,
-                        "client_id": client_id,
-                        "round_id": round_id,
-                        "step": trainer.step,
-                        "num_tokens": int(num_tokens),
-                    },
-                    temporary_path,
-                )
+                with self.timer.measure("leader_write_consolidated_tensor_checkpoint", round_id) if self.timer else nullcontext():
+                    torch.save(
+                        {
+                            "model": flat_state,
+                            "client_id": client_id,
+                            "round_id": round_id,
+                            "step": trainer.step,
+                            "num_tokens": int(num_tokens),
+                        },
+                        temporary_path,
+                    )
 
-                os.replace(temporary_path, consolidated_path)
+                    os.replace(temporary_path, consolidated_path)
                 temporary_flat_path.unlink(missing_ok=True)
 
             dist.barrier()
@@ -374,21 +395,23 @@ class TorchTitanBackend:
         distributed_root.mkdir(parents=True, exist_ok=True)
 
         if rank == leader_rank:
-            payload = torch.load(
-                model_path,
-                map_location="cpu",
-                weights_only=False,
-            )
 
-            flat_state = payload.get("model", payload)
-            torch.save(flat_state, flat_model_path)
+            with self.timer.measure("leader_normal_tensor_to_dcp", round_id) if self.timer else nullcontext():
+                payload = torch.load(
+                    model_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
 
-            torch_save_to_dcp(
-                str(flat_model_path),
-                str(dcp_step_path),
-            )
+                flat_state = payload.get("model", payload)
+                torch.save(flat_state, flat_model_path)
 
-            flat_model_path.unlink(missing_ok=True)
+                torch_save_to_dcp(
+                    str(flat_model_path),
+                    str(dcp_step_path),
+                )
+
+                flat_model_path.unlink(missing_ok=True)
 
         dist.barrier()
 
@@ -396,12 +419,13 @@ class TorchTitanBackend:
         trainer.checkpointer.folder = str(distributed_root)
 
         try:
-            loaded = trainer.checkpointer.load(step=0)
+            with self.timer.measure("rank_load_dcp_into_dtensor_model", round_id) if self.timer else nullcontext():
+                loaded = trainer.checkpointer.load(step=0)
 
-            if not loaded:
-                raise RuntimeError(
-                    f"Failed to load global model from {dcp_step_path}"
-                )
+                if not loaded:
+                    raise RuntimeError(
+                        f"Failed to load global model from {dcp_step_path}"
+                    )
         finally:
             trainer.checkpointer.folder = original_folder
 

@@ -59,17 +59,17 @@ torchtitan:
     checkpoint.enable: true
     checkpoint.last_save_model_only: true
     parallelism.pipeline_parallel_degree: 2
-    parallelism.tensor_parallel_degree: 8
+    parallelism.tensor_parallel_degree: 4
     parallelism.enable_sequence_parallel: false
     parallelism.data_parallel_replicate_degree: 1
-    parallelism.data_parallel_shard_degree: 1
+    parallelism.data_parallel_shard_degree: 2
 
   subclusters:
     enabled: true
     num_clients: 2
-    nodes_per_client: 2
+    nodes_per_client: 4
     # nodes_per_client: [2, 3, 1]
-    gpus_per_node: 8
+    gpus_per_node: 4
     leader_rank: 0
     master_port_base: 29600
     checkpoint_root: /lustre/orion/gen150/scratch/sabiha/omnifed_titan
