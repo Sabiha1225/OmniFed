@@ -58,7 +58,7 @@ class SlurmConfig:
             f"#SBATCH --time={self.time}",
             f"#SBATCH --signal=B:{self.preempt_signal}@{self.preempt_notice_sec}",
             f"#SBATCH -C nvme",
-            # f"#SBATCH --exclusive",
+            f"#SBATCH --exclusive",
         ]
 
         if self.ntasks:
