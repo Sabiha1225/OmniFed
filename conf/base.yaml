@@ -195,7 +195,7 @@ slurm:
   time: "02:00:00"
   nodes: 2
   ntasks_per_node: 1
-  cpus_per_task: 8
+  cpus_per_task: 6
   gpus_per_node: 1
   gpus_per_task: 1
   gres: gpu:1

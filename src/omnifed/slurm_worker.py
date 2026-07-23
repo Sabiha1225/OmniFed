@@ -476,14 +476,26 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
         # Every rank within this subcluster reaches this point.
         # dist.barrier()
 
+        print(
+            f"[client {role.client_id} rank {role.torchtitan_rank}] "
+            f"starting initial load: {initial_path}",
+            flush=True,
+        )
+
         # Load initial ordinary tensors into this client's PP/TP model.
         backend.load_global_model(
             model_path=str(initial_path),
             round_id=-1,
         )
 
+        print(
+            f"[client {role.client_id} rank {role.torchtitan_rank}] "
+            "finished initial load",
+            flush=True,
+        )
+
         # dist.barrier()
-        maybe_dist_barrier()
+        # maybe_dist_barrier()
 
         # Federated rounds.
         for round_id in range(int(cfg.global_rounds)):
@@ -552,20 +564,32 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
 
             # Convert global tensors back into PP/TP DTensors.
             with timer.measure("convert_global_tensor_to_dtensor", round_id):
+                print(
+                    f"[client {role.client_id} rank {role.torchtitan_rank}] "
+                    f"starting global load for round {round_id}: {global_path}",
+                    flush=True,
+                )
+
                 backend.load_global_model(
                     model_path=str(global_path),
                     round_id=round_id,
                 )
 
+                print(
+                    f"[client {role.client_id} rank {role.torchtitan_rank}] "
+                    f"finished global load for round {round_id}",
+                    flush=True,
+                )
+
             # dist.barrier()
-            maybe_dist_barrier()
+            # maybe_dist_barrier()
 
     finally:
 
-        try:
-            maybe_dist_barrier()
-        except Exception:
-            pass
+        # try:
+        #     maybe_dist_barrier()
+        # except Exception:
+        #     pass
 
         if communicator is not None:
             communicator.close()
