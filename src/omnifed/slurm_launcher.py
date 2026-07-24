@@ -252,10 +252,10 @@ class SlurmTorchTitanLauncher:
             lines += [
                 f'CLIENT_{client_id}_NODES=$(IFS=,; echo "${{HOSTS[*]:{first_node}:{nodes_per_client}}}")',
                 f'CLIENT_{client_id}_MASTER="${{HOSTS[{first_node}]}}"',
-                'export TORCH_NCCL_DESYNC_DEBUG=1',
-                'export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576',
-                'export NCCL_DEBUG=INFO',
-                'export NCCL_DEBUG_SUBSYS=INIT,COLL',
+                #'export TORCH_NCCL_DESYNC_DEBUG=1',
+                #'export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576',
+                #'export NCCL_DEBUG=INFO',
+                #'export NCCL_DEBUG_SUBSYS=INIT,COLL',
                 (
                     f"srun --exclusive --nodes={nodes_per_client} "
                     f"--ntasks={world_size} --ntasks-per-node={gpus_per_node} "

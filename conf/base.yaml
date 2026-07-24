@@ -31,31 +31,21 @@ overwrite: false
 backend:
   internal_backend: torchtitan   # options: torchdist, torchtitan
 
-# torchtitan:
-#   root: /home/sabiha/torchtitan-omnifed
-#   module: llama3
-#   config_name: llama3_debugmodel
-#   hf_assets_path: /home/sabiha/torchtitan-omnifed/tests/assets/tokenizer
-#   dataset_path: /home/sabiha/torchtitan-omnifed/tests/assets/c4_test
-#   output_dir: outputs/torchtitan_site
-#   update_dir: outputs/federated_updates
-#   overrides: {}
-
-# federated:
-#   local_steps: 100
-#   rounds: 10
-
-
 torchtitan:
   root: /ccs/home/sabiha/torchtitan-omnifed
-  module: llama3
-  config_name: llama3_debugmodel
-  hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/tokenizer
+  # module: llama3
+  # config_name: llama3_debugmodel
+  # hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/tokenizer
+  module: qwen3
+  config_name: qwen3_1_7b
+  hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/assets/hf/Qwen3-1.7B
   dataset_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/c4_test
   output_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/runtime
   update_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/updates
   overrides:
-    training.steps: 10
+    training.steps: 6
+    training.seq_len: 1024
+    training.local_batch_size: 1
     checkpoint.enable: true
     checkpoint.last_save_model_only: true
     parallelism.pipeline_parallel_degree: 2
@@ -174,7 +164,7 @@ hydra:
   run:
     # Output directory for FL experiment results and logs
     # Docs: https://hydra.cc/docs/configure_hydra/workdir/
-    dir: outputs/${now:%Y-%m-%d}/${hydra.job.config_name}
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_${hydra.job.config_name}
 
     # Alternative example patterns:
     # dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}              # Group by date/time

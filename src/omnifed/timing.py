@@ -17,19 +17,43 @@ def _sync():
 
 class TimingRecorder:
     def __init__(self, root: str | os.PathLike[str], role: str, rank: int):
-        self.path = Path(root) / "timing" / f"{role}_rank_{rank}.csv"
+        self.role = role
+        self.rank = rank
+        self.client_id = os.environ.get("CLIENT_ID", "")
+
+        timing_root = Path(root) / "timing"
+
+        if role == "client":
+            if self.client_id == "":
+                raise ValueError(
+                    "CLIENT_ID must be set before creating a client TimingRecorder"
+                )
+
+            self.path = (
+                timing_root
+                / f"client_{self.client_id}"
+                / f"rank_{rank}.csv"
+            )
+        else:
+            self.path = timing_root / f"{role}_rank_{rank}.csv"
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
         if not self.path.exists():
             with open(self.path, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(
-                    ["time", "role", "rank", "client_id", "round", "phase", "seconds", "extra"]
+                    [
+                        "time",
+                        "role",
+                        "rank",
+                        "client_id",
+                        "round",
+                        "phase",
+                        "seconds",
+                        "extra",
+                    ]
                 )
-
-        self.role = role
-        self.rank = rank
-        self.client_id = os.environ.get("CLIENT_ID", "")
 
     @contextmanager
     def measure(self, phase: str, round_id: int | str = "", extra: str = ""):
