@@ -43,6 +43,7 @@ torchtitan:
   output_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/runtime
   update_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/updates
   overrides:
+    dataloader.dataset: c4_test
     training.steps: 6
     training.seq_len: 1024
     training.local_batch_size: 1
