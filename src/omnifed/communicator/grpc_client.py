@@ -169,12 +169,24 @@ class GrpcClient:
                 reduction_type=reduction_type.value,
             )
             response = self.stub.SubmitForAggregation(request)
-            if response.success:
-                print("Successfully sent local model to server")
-            else:
-                print("Submit failed")
+            # if response.success:
+            #     print("Successfully sent local model to server")
+            # else:
+            #     print("Submit failed")
+            if not response.success:
+                raise RuntimeError(
+                    f"Server rejected aggregation submission from "
+                    f"client {self.client_id}"
+                )
+
+            print("Successfully sent local model to server")
+        # except grpc.RpcError as e:
+        #     print(f"Submit exception | {e}")
         except grpc.RpcError as e:
-            print(f"Submit exception | {e}")
+            raise RuntimeError(
+                f"Failed to submit aggregation data for client "
+                f"{self.client_id}"
+            ) from e
 
     def get_aggregation_result(self) -> Dict[str, torch.Tensor]:
         """
