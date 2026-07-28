@@ -37,8 +37,8 @@ torchtitan:
   # config_name: llama3_debugmodel
   # hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/tokenizer
   module: qwen3
-  config_name: qwen3_1_7b
-  hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/assets/hf/Qwen3-1.7B
+  config_name: qwen3_0_6b
+  hf_assets_path: /ccs/home/sabiha/torchtitan-omnifed/assets/hf/Qwen3-0.6B
   dataset_path: /ccs/home/sabiha/torchtitan-omnifed/tests/assets/c4_test
   output_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/runtime
   update_dir: /lustre/orion/gen150/scratch/sabiha/omnifed_titan/updates
