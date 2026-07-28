@@ -117,6 +117,8 @@ def create_federated_communicator(cfg, federated_rank: int, server_addr: str):
         client_timeout=float(
             cfg.torchtitan.federated.aggregation_timeout
         ),
+        max_retries=120,
+        retry_delay=5.0,
     )
     communicator.setup()
     return communicator

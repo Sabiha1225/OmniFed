@@ -237,12 +237,36 @@ class SlurmTorchTitanLauncher:
             f'CHECKPOINT_ROOT="{checkpoint_root}/job_${{SLURM_JOB_ID}}"',
             'mkdir -p "$CHECKPOINT_ROOT"',
             "",
+            
+            # Start the federated server in the background.
             'srun --exclusive --nodes=1 --ntasks=1 '
             '--nodelist="$SERVER_HOST" '
             'env OMNIFED_ROLE=server '
             'FEDERATED_RANK=0 '
             'CHECKPOINT_ROOT="$CHECKPOINT_ROOT" '
             f'{worker_entrypoint} &',
+            
+            # Wait until the gRPC server is accepting connections.
+            "",
+            'SERVER_PORT=50051',
+            'SERVER_READY=0',
+            'echo "[setup] waiting for gRPC server at ${SERVER_HOST}:${SERVER_PORT}"',
+
+            'for attempt in $(seq 1 120); do',
+            '    if timeout 2 bash -c "</dev/tcp/${SERVER_HOST}/${SERVER_PORT}" 2>/dev/null; then',
+            '        SERVER_READY=1',
+            '        echo "[setup] gRPC server is reachable"',
+            '        break',
+            '    fi',
+            '    echo "[setup] server not ready: attempt ${attempt}/120"',
+            '    sleep 5',
+            'done',
+
+            'if [ "$SERVER_READY" -ne 1 ]; then',
+            '    echo "[setup] ERROR: gRPC server did not become ready"',
+            '    exit 1',
+            'fi',
+            "",
         ]
 
         for client_id in range(num_clients):
