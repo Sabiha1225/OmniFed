@@ -22,7 +22,7 @@ from torch.distributed.checkpoint.format_utils import (
 # )
 
 from contextlib import nullcontext
-from src.omnifed.timing import measure_torch_collectives
+from src.omnifed.timing import profile_torchtitan_communication
 
 
 
@@ -44,6 +44,16 @@ class TorchTitanBackend:
         self._output_dir = kwargs.pop("output_dir", None)
         self._update_dir = kwargs.pop("update_dir", None)
         self.timer = None
+
+        # export OMNIFED_PROFILE_TORCH_COMM=1, It enable expensive communication 
+        # profiling from the Slurm script If it is 0, per-iteration total time is 
+        # still recorded, but detailed profiler communication is disabled.
+        self.profile_iteration_communication = (
+            os.environ.get(
+                "OMNIFED_PROFILE_TORCH_COMM",
+                "1",
+            ) == "1"
+        )
 
     @staticmethod
     def _get_nested(cfg: Any | None, attr: str, default: Any = None) -> Any:
@@ -197,6 +207,9 @@ class TorchTitanBackend:
 
         local_steps = int(steps or 1)
         tokens_before = int(trainer.ntokens_seen)
+        round_id = int(
+            getattr(self, "current_round_id", -1)
+        )
 
         data_iterator = trainer.batch_generator(
             trainer.dataloader
@@ -204,24 +217,29 @@ class TorchTitanBackend:
 
         steps_run = 0
 
-        # for _ in range(local_steps):
-        #     trainer.step += 1
-        #     trainer.train_step(data_iterator)
-        #     steps_run += 1
+        for iteration in range(1, local_steps + 1):
+            trainer.step += 1
+            global_step = int(trainer.step)
 
-        round_id = getattr(self, "current_round_id", "")
-
-        collective_ctx = (
-            measure_torch_collectives(self.timer, round_id)
-            if self.timer is not None
-            else nullcontext()
-        )
-
-        with collective_ctx:
-            for _ in range(local_steps):
-                trainer.step += 1
+            if self.timer is not None:
+                with profile_torchtitan_communication(
+                    timer=self.timer,
+                    round_id=round_id,
+                    iteration=iteration,
+                    global_step=global_step,
+                    enabled=self.profile_iteration_communication,
+                ):
+                    with self.timer.measure(
+                        phase="torchtitan_iteration_total",
+                        round_id=round_id,
+                        iteration=iteration,
+                        global_step=global_step,
+                    ):
+                        trainer.train_step(data_iterator)
+            else:
                 trainer.train_step(data_iterator)
-                steps_run += 1
+
+            steps_run += 1
 
         tokens_this_round = (
             int(trainer.ntokens_seen) - tokens_before
@@ -229,7 +247,7 @@ class TorchTitanBackend:
 
         return {
             "steps_run": steps_run,
-            "step": trainer.step,
+            "step": int(trainer.step),
             "num_tokens": tokens_this_round,
         }
 

@@ -596,6 +596,7 @@ def run_client_global_communication(
     result,
     timer=None,
     round_id=None,
+    global_step=None,
 ):
 
     with timer.measure("client_load_consolidated_tensor_checkpoint", round_id) if timer else nullcontext():
@@ -607,7 +608,12 @@ def run_client_global_communication(
     local_state = payload["model"]
     local_tokens = float(payload["num_tokens"])
 
-    with timer.measure("grpc_client_token_count_aggregation", round_id) if timer else nullcontext():
+    with timer.measure(
+        phase="grpc_client_token_count_aggregation", 
+        round_id=round_id,
+        iteration="",
+        global_step=global_step,
+    ) if timer else nullcontext():
         total_tokens = communicator.aggregate(
             torch.tensor([local_tokens], dtype=torch.float64),
             AggregationOp.SUM,
@@ -627,8 +633,10 @@ def run_client_global_communication(
         }
 
         with timer.measure(
-            "grpc_client_send_wait_receive_model_chunk",
-            round_id,
+            phase="grpc_client_send_wait_receive_model_chunk",
+            round_id=round_id,
+            iteration="",
+            global_step=global_step,
             extra=f"chunk_id={chunk_id},num_tensors={len(weighted_chunk)}",
         ) if timer else nullcontext():
             result_chunk = communicator.aggregate(
@@ -759,13 +767,23 @@ def run_torchtitan_client(cfg, role: SlurmRole) -> None:
                 #     communicator=communicator,
                 #     result=local_result,
                 # )
-                aggregated_state = run_client_global_communication(
-                    cfg=cfg,
-                    communicator=communicator,
-                    result=local_result,
-                    timer=timer,
+
+                with timer.measure(
+                    phase="grpc_round_communication_total",
                     round_id=round_id,
-                )
+                    iteration="",
+                    global_step=int(train_result["step"]),
+                    extra=f"client_id={role.client_id}",
+                ):
+
+                    aggregated_state = run_client_global_communication(
+                        cfg=cfg,
+                        communicator=communicator,
+                        result=local_result,
+                        timer=timer,
+                        round_id=round_id,
+                        global_step=int(train_result["step"]),
+                    )
 
                 with timer.measure("client_write_global_tensor_model", round_id):
                     global_path.parent.mkdir(
