@@ -185,6 +185,103 @@ def _event_device_time_us(event) -> float:
     return 0.0
 
 
+def _event_interval_us(event) -> tuple[float, float] | None:
+    """Return an event's profiler-timeline interval in microseconds."""
+    time_range = getattr(event, "time_range", None)
+    if time_range is None:
+        return None
+
+    start = getattr(time_range, "start", None)
+    end = getattr(time_range, "end", None)
+    if start is None or end is None:
+        return None
+
+    start = float(start)
+    end = float(end)
+    if end <= start:
+        return None
+    return start, end
+
+
+def _is_device_event(event) -> bool:
+    """Identify GPU events without depending on one PyTorch enum version."""
+    device_type = str(getattr(event, "device_type", "")).lower()
+    return any(name in device_type for name in ("cuda", "hip", "privateuse1"))
+
+
+def _event_communication_category(event) -> str | None:
+    """Classify a GPU kernel, consulting its CPU parent chain if needed."""
+    current = event
+    visited: set[int] = set()
+    generic_category: str | None = None
+
+    for _ in range(12):
+        if current is None or id(current) in visited:
+            break
+        visited.add(id(current))
+
+        name = str(
+            getattr(current, "name", "")
+            or getattr(current, "key", "")
+        )
+        category = _communication_category(name)
+        if category is not None and category != "other_collective":
+            return category
+        if category == "other_collective":
+            generic_category = category
+
+        current = getattr(current, "cpu_parent", None)
+
+    return generic_category
+
+
+def _merge_intervals(
+    intervals: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Merge overlapping timeline intervals."""
+    if not intervals:
+        return []
+
+    ordered = sorted(intervals)
+    merged: list[list[float]] = [[ordered[0][0], ordered[0][1]]]
+
+    for start, end in ordered[1:]:
+        previous = merged[-1]
+        if start <= previous[1]:
+            previous[1] = max(previous[1], end)
+        else:
+            merged.append([start, end])
+
+    return [(start, end) for start, end in merged]
+
+
+def _interval_duration_us(intervals: list[tuple[float, float]]) -> float:
+    return sum(end - start for start, end in intervals)
+
+
+def _intersection_duration_us(
+    first: list[tuple[float, float]],
+    second: list[tuple[float, float]],
+) -> float:
+    """Measure the intersection of two already-merged interval lists."""
+    i = 0
+    j = 0
+    duration = 0.0
+
+    while i < len(first) and j < len(second):
+        start = max(first[i][0], second[j][0])
+        end = min(first[i][1], second[j][1])
+        if end > start:
+            duration += end - start
+
+        if first[i][1] <= second[j][1]:
+            i += 1
+        else:
+            j += 1
+
+    return duration
+
+
 @contextmanager
 def profile_torchtitan_communication(
     timer: TimingRecorder,
@@ -221,6 +318,8 @@ def profile_torchtitan_communication(
 
     _sync_gpu()
 
+    # key_averages() sums event durations and can double count concurrent or
+    # nested work. Keep that diagnostic separately from the wall-time metrics.
     totals_us: dict[str, float] = defaultdict(float)
     event_counts: dict[str, int] = defaultdict(int)
 
@@ -255,7 +354,7 @@ def profile_torchtitan_communication(
     total_communication_us = sum(totals_us.values())
 
     timer.record(
-        phase="torchtitan_iteration_communication_total",
+        phase="torchtitan_iteration_communication_accumulated",
         seconds=total_communication_us / 1_000_000.0,
         round_id=round_id,
         iteration=iteration,
@@ -265,10 +364,80 @@ def profile_torchtitan_communication(
 
     for category, microseconds in sorted(totals_us.items()):
         timer.record(
-            phase=f"torchtitan_iteration_{category}",
+            phase=f"torchtitan_iteration_{category}_accumulated",
             seconds=microseconds / 1_000_000.0,
             round_id=round_id,
             iteration=iteration,
             global_step=global_step,
             extra=f"count={event_counts[category]}",
+        )
+
+    # Raw GPU intervals provide non-double-counted wall time. Communication
+    # and compute are merged separately, then intersected to measure overlap.
+    communication_intervals: list[tuple[float, float]] = []
+    compute_intervals: list[tuple[float, float]] = []
+    category_intervals: dict[str, list[tuple[float, float]]] = defaultdict(list)
+
+    for event in profiler.events():
+        if not _is_device_event(event):
+            continue
+
+        interval = _event_interval_us(event)
+        if interval is None:
+            continue
+
+        category = _event_communication_category(event)
+        if category is None:
+            compute_intervals.append(interval)
+        else:
+            communication_intervals.append(interval)
+            category_intervals[category].append(interval)
+
+    merged_communication = _merge_intervals(communication_intervals)
+    merged_compute = _merge_intervals(compute_intervals)
+    communication_active_us = _interval_duration_us(merged_communication)
+    compute_active_us = _interval_duration_us(merged_compute)
+    overlap_us = _intersection_duration_us(
+        merged_communication,
+        merged_compute,
+    )
+    exposed_us = max(0.0, communication_active_us - overlap_us)
+    overlap_ratio = (
+        overlap_us / communication_active_us
+        if communication_active_us > 0
+        else 0.0
+    )
+
+    wall_metrics = {
+        "torchtitan_iteration_communication_active_wall": communication_active_us,
+        "torchtitan_iteration_communication_overlapped_wall": overlap_us,
+        "torchtitan_iteration_communication_exposed_wall": exposed_us,
+        "torchtitan_iteration_compute_active_wall": compute_active_us,
+    }
+    common_extra = (
+        f"comm_intervals={len(communication_intervals)};"
+        f"comm_merged={len(merged_communication)};"
+        f"compute_intervals={len(compute_intervals)};"
+        f"overlap_ratio={overlap_ratio:.6f}"
+    )
+
+    for phase, microseconds in wall_metrics.items():
+        timer.record(
+            phase=phase,
+            seconds=microseconds / 1_000_000.0,
+            round_id=round_id,
+            iteration=iteration,
+            global_step=global_step,
+            extra=common_extra,
+        )
+
+    for category, intervals in sorted(category_intervals.items()):
+        merged = _merge_intervals(intervals)
+        timer.record(
+            phase=f"torchtitan_iteration_{category}_active_wall",
+            seconds=_interval_duration_us(merged) / 1_000_000.0,
+            round_id=round_id,
+            iteration=iteration,
+            global_step=global_step,
+            extra=f"events={len(intervals)};merged_intervals={len(merged)}",
         )
