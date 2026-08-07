@@ -55,6 +55,12 @@ torchtitan:
     parallelism.data_parallel_replicate_degree: 1
     parallelism.data_parallel_shard_degree: 2
 
+    profiler.enable_profiling: true
+    profiler.profile_freq: 6
+    profiler.profiler_warmup: 1
+    profiler.profiler_active: 1
+    profiler.save_traces_folder: profiler_traces
+
   subclusters:
     enabled: true
     num_clients: 2
