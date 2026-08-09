@@ -85,6 +85,12 @@ class TorchTitanBackend:
             torchtitan_cfg, "dataset_path", None
         )
 
+        attention_backend = self._get_nested(
+            torchtitan_cfg,
+            "attention_backend",
+            None,
+        )
+
         if not config_name:
             raise ValueError(
                 "Torchtitan config_name is required. Set torchtitan.config_name or pass it explicitly."
@@ -101,6 +107,7 @@ class TorchTitanBackend:
             ),
             "hf_assets_path": hf_assets_path,
             "dataset_path": dataset_path,
+            "attention_backend": attention_backend,
         }
 
     def _add_torchtitan_to_path(self, root: str | os.PathLike[str] | None) -> None:
@@ -117,6 +124,129 @@ class TorchTitanBackend:
         if torchtitan_root_str not in sys.path:
             sys.path.insert(0, torchtitan_root_str)
 
+    
+    @staticmethod
+    def _apply_attention_backend(
+        config: Any,
+        attention_backend: str | None,
+    ) -> None:
+        """
+        Replace the attention configuration before TorchTitan builds the model.
+
+        TorchTitan's config registry has already created the model layer
+        configurations by this point, but Trainer(config) has not yet built
+        the actual model modules.
+        """
+        if attention_backend is None:
+            print(
+                "[TorchTitanBackend] No OmniFed attention override supplied; "
+                "using the TorchTitan configuration default.",
+                flush=True,
+            )
+            return
+
+        attention_backend = str(attention_backend).strip().lower()
+
+        supported_backends = {
+            "sdpa",
+            "flex",
+            "flex_flash",
+            "varlen",
+        }
+
+        if attention_backend not in supported_backends:
+            raise ValueError(
+                f"Unsupported attention backend: {attention_backend!r}. "
+                f"Expected one of {sorted(supported_backends)}."
+            )
+
+        # Frontier uses AMD MI250X GPUs. This option is restricted by
+        # TorchTitan to NVIDIA Hopper/Blackwell.
+        if attention_backend == "flex_flash":
+            raise ValueError(
+                "attention_backend='flex_flash' is not supported on "
+                "Frontier MI250X GPUs. Use 'sdpa' or 'flex'."
+            )
+
+        from torchtitan.models.common.config_utils import (
+            get_attention_config,
+        )
+
+        inner_attention, mask_type = get_attention_config(
+            attention_backend
+        )
+
+        model_spec = getattr(config, "model_spec", None)
+
+        if model_spec is None:
+            raise ValueError(
+                "TorchTitan configuration does not contain model_spec."
+            )
+
+        model_config = getattr(model_spec, "model", None)
+
+        if model_config is None:
+            raise ValueError(
+                "TorchTitan model_spec does not contain a model configuration."
+            )
+
+        layers = getattr(model_config, "layers", None)
+
+        if layers is None:
+            raise ValueError(
+                "The selected TorchTitan model does not expose a layers "
+                "configuration. The OmniFed attention override cannot be "
+                "applied automatically."
+            )
+
+        updated_layers = 0
+
+        for layer_id, layer_config in enumerate(layers):
+            attention_config = getattr(
+                layer_config,
+                "attention",
+                None,
+            )
+
+            if attention_config is None:
+                continue
+
+            if not hasattr(attention_config, "inner_attention"):
+                raise ValueError(
+                    f"Layer {layer_id} has an attention configuration, "
+                    "but it does not contain inner_attention."
+                )
+
+            attention_config.inner_attention = inner_attention
+
+            # SDPA expects a causal mask, while FlexAttention normally uses
+            # a block-causal mask. Both fields must remain consistent.
+            if hasattr(attention_config, "mask_type"):
+                attention_config.mask_type = mask_type
+
+            updated_layers += 1
+
+        if updated_layers == 0:
+            raise ValueError(
+                "No compatible attention layers were found in the "
+                "TorchTitan model configuration."
+            )
+
+        effective_config = (
+            model_config.layers[0]
+            .attention
+            .inner_attention
+        )
+
+        print(
+            "[TorchTitanBackend] Attention backend override applied: "
+            f"requested={attention_backend}, "
+            f"config={effective_config.__class__.__qualname__}, "
+            f"mask_type={mask_type}, "
+            f"updated_layers={updated_layers}",
+            flush=True,
+        )
+    
     def setup(self) -> Any:
         if self._trainer is not None:
             return self._trainer
@@ -189,6 +319,13 @@ class TorchTitanBackend:
 
         config_manager = ConfigManager()
         config = config_manager.parse_args(args=args)
+        self._apply_attention_backend(
+            config=config,
+            attention_backend=config_spec.get(
+                "attention_backend"
+            ),
+        )
+        
         if config_spec.get("hf_assets_path"):
             config.hf_assets_path = config_spec["hf_assets_path"]
         if config_spec.get("dataset_path"):
