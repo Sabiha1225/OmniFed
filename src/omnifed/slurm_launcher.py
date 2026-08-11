@@ -21,7 +21,7 @@ class SlurmConfig:
     time: str = "02:00:00"
     nodes: int = 2
     ntasks_per_node: int = 1
-    cpus_per_task: int = 8
+    cpus_per_task: int = 6
 
     # GPU options
     gres: Optional[str] = None
