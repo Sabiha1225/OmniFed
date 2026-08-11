@@ -156,7 +156,7 @@ slurm:
   setup_lines:
     # site modules/env (edit for Frontier/site)
     - 'module load cray-python || true'
-    - 'export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"'
+    - 'export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK'
   # Parent Lustre dir for hybrid round checkpoints; use with ``experiment_id``.
   checkpoint_dir: null
   # Subdirectory under ``checkpoint_dir`` (stable across resubmits). See ``docs/CHECKPOINTING_HYBRID_SLURM_PLAN.md``.
