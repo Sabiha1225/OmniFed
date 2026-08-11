@@ -123,7 +123,8 @@ class SlurmOnlyLauncher:
         lines += sconf.sbatch_lines()
         lines += [
             "set -euo pipefail",
-            f'export PYTHONPATH="${{PYTHONPATH:-}}:{repo_root}"',
+            # f'export PYTHONPATH="${{PYTHONPATH:-}}:{repo_root}"',
+            f'export PYTHONPATH="{repo_root}:${{PYTHONPATH:-}}"',
             'export PYTHONUNBUFFERED=1',
             'export HYDRA_FULL_ERROR=1',
             'export OMNIFED_DEBUG=${OMNIFED_DEBUG:-0}',

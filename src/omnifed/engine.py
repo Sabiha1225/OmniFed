@@ -49,6 +49,7 @@ from omegaconf import OmegaConf
 from .slurm_launcher import SlurmConfig, SlurmOnlyLauncher
 from .engine_communication import communication_mode, resolve_slurm_ntasks
 import sys
+import shlex
 
 LOG_FLUSH_DELAY = 2.0
 
@@ -336,7 +337,8 @@ class Engine(RequiredSetup):
                 sconf.stderr = os.path.join(self.hydra_cfg.runtime.output_dir, "slurm-%j.err")
 
                 # IMPORTANT: this python is only used before setup_lines runs
-                sconf.pyexe = "python"
+                # sconf.pyexe = "python"
+                sconf.pyexe = sys.executable
 
                 # 4) Frontier / site environment (edit paths for your user + conda env)
                 sconf.setup_lines = [
@@ -345,13 +347,16 @@ class Engine(RequiredSetup):
                     "module load craype-accel-amd-gfx90a",
                     "module load miniforge3/23.11.0-0",
                     # MNIST + caches (torchvision reads OMNIFED_DATA_DIR)
-                    'export OMNIFED_DATA_DIR="/lustre/orion/gen150/scratch/shruti2395/omnifed_data"',
-                    'mkdir -p "$OMNIFED_DATA_DIR"',
-                    'echo "[setup] OMNIFED_DATA_DIR=$OMNIFED_DATA_DIR"',
+                    # 'export OMNIFED_DATA_DIR="/lustre/orion/gen150/scratch/shruti2395/omnifed_data"',
+                    # 'mkdir -p "$OMNIFED_DATA_DIR"',
+                    # 'echo "[setup] OMNIFED_DATA_DIR=$OMNIFED_DATA_DIR"',
                     # Use your conda env Python on compute nodes (no conda-pack / sbcast)
-                    'export PYEXE="/ccs/home/shruti2395/.conda/envs/pytorch_rocm/bin/python"',
+                    # 'export PYEXE="/ccs/home/shruti2395/.conda/envs/pytorch_rocm/bin/python"',
+                    # 'echo "[setup] PYEXE=$PYEXE"',
+                    # '"$PYEXE" -c "import torch; print(torch.__version__)"',
+                    f"export PYEXE={shlex.quote(sconf.pyexe)}",
                     'echo "[setup] PYEXE=$PYEXE"',
-                    '"$PYEXE" -c "import torch; print(torch.__version__)"',
+                    '"$PYEXE" -c "import sys, torch; print(sys.executable); print(torch.__version__)"',
                     "",
                     "export MIOPEN_USER_DB_PATH=/tmp/${USER}/miopen-cache",
                     "export MIOPEN_CUSTOM_CACHE_DIR=${MIOPEN_USER_DB_PATH}",
