@@ -346,6 +346,10 @@ class Engine(RequiredSetup):
                     "module load rocm/6.4.1",
                     "module load craype-accel-amd-gfx90a",
                     "module load miniforge3/23.11.0-0",
+
+                    # Match CPU threading to #SBATCH --cpus-per-task
+                    'export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"',
+                    'echo "[setup] OMP_NUM_THREADS=$OMP_NUM_THREADS"',
                     # MNIST + caches (torchvision reads OMNIFED_DATA_DIR)
                     # 'export OMNIFED_DATA_DIR="/lustre/orion/gen150/scratch/shruti2395/omnifed_data"',
                     # 'mkdir -p "$OMNIFED_DATA_DIR"',
