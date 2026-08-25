@@ -46,6 +46,7 @@ torchtitan:
   module: llama3
   config_name: llama3_8b
   attention_backend: flex
+  # attention_backend: null
 
   # Export these before launching:
   #

@@ -147,10 +147,15 @@ class TorchTitanBackend:
 
         attention_backend = str(attention_backend).strip().lower()
 
+        # supported_backends = {
+        #     "sdpa", 
+        #     "flex", valid and the safest default for Llama training.
+        #     "flex_flash", upstream restricts this path through a CUDA capability check, so it is not suitable for Frontier AMD MI250X.
+        #     "varlen", valid if the installed Torch/PyTorch build supports it properly.
+        # }
+
         supported_backends = {
-            "sdpa",
             "flex",
-            "flex_flash",
             "varlen",
         }
 
@@ -162,19 +167,35 @@ class TorchTitanBackend:
 
         # Frontier uses AMD MI250X GPUs. This option is restricted by
         # TorchTitan to NVIDIA Hopper/Blackwell.
-        if attention_backend == "flex_flash":
-            raise ValueError(
-                "attention_backend='flex_flash' is not supported on "
-                "Frontier MI250X GPUs. Use 'sdpa' or 'flex'."
-            )
+        # if attention_backend == "flex_flash":
+        #     raise ValueError(
+        #         "attention_backend='flex_flash' is not supported on "
+        #         "Frontier MI250X GPUs. Use 'flex' or 'varlen'."
+        #     )
 
         from torchtitan.models.common.config_utils import (
             get_attention_config,
         )
 
-        inner_attention, mask_type = get_attention_config(
-            attention_backend
-        )
+        # inner_attention, mask_type = get_attention_config(
+        #     attention_backend
+        # )
+
+        attention_result = get_attention_config(attention_backend)
+
+        # Older TorchTitan API:
+        #     (inner_attention, mask_type)
+        #
+        # Current TorchTitan API: Masking is handled by the model.
+        #     inner_attention
+        if (
+            isinstance(attention_result, tuple)
+            and len(attention_result) == 2
+        ):
+            inner_attention, mask_type = attention_result
+        else:
+            inner_attention = attention_result
+            mask_type = None
 
         model_spec = getattr(config, "model_spec", None)
 
@@ -219,9 +240,12 @@ class TorchTitanBackend:
 
             attention_config.inner_attention = inner_attention
 
-            # SDPA expects a causal mask, while FlexAttention normally uses
-            # a block-causal mask. Both fields must remain consistent.
-            if hasattr(attention_config, "mask_type"):
+            # Older TorchTitan configurations store mask_type on each
+            # attention configuration. Current versions manage masks separately.
+            if (
+                mask_type is not None
+                and hasattr(attention_config, "mask_type")
+            ):
                 attention_config.mask_type = mask_type
 
             updated_layers += 1
