@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+from typing import Any
+
+from .config import SlurmConfig
+
+
+class TorchTitanSlurmLauncher:
+    @staticmethod
+    def submit_or_exit(
+        sconf: SlurmConfig,
+        launcher_cfg: dict[str, Any],
+    ) -> None:
+        if not sconf.work_dir:
+            raise ValueError(
+                "Slurm work_dir is required"
+            )
+
+        if not sconf.cfg_json_path:
+            raise ValueError(
+                "Frozen configuration path is required"
+            )
+
+        subclusters = launcher_cfg["subclusters"]
+
+        num_clients = int(
+            subclusters["num_clients"]
+        )
+
+        if num_clients <= 0:
+            raise ValueError(
+                "num_clients must be positive"
+            )
+
+        nodes_per_client = int(
+            subclusters["nodes_per_client"]
+        )
+
+        if nodes_per_client <= 0:
+            raise ValueError(
+                "nodes_per_client must be positive"
+            )
+
+        gpus_per_node = int(
+            subclusters["gpus_per_node"]
+        )
+
+        if gpus_per_node <= 0:
+            raise ValueError(
+                "gpus_per_node must be positive"
+            )
+
+        leader_rank = int(
+            subclusters["leader_rank"]
+        )
+        master_port_base = int(
+            subclusters["master_port_base"]
+        )
+        checkpoint_root = str(
+            subclusters["checkpoint_root"]
+        )
+
+        server_port = int(
+            launcher_cfg["server_port"]
+        )
+
+        pyexe = (
+            sconf.pyexe
+            or os.getenv("PYEXE")
+            or "python"
+        )
+
+        worker_entrypoint = (
+            "bash -lc "
+            + shlex.quote(
+                'if [ -n "${ROCR_VISIBLE_DEVICES:-}" ] && [ -z "${HIP_VISIBLE_DEVICES:-}" ]; then '
+                'export HIP_VISIBLE_DEVICES="$ROCR_VISIBLE_DEVICES"; '
+                'fi; '
+                'unset ROCR_VISIBLE_DEVICES; '
+                'export HF_HOME="/mnt/bb/${USER}/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; '
+                'export HF_DATASETS_CACHE="${HF_HOME}/datasets"; '
+                'export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; '
+                'mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; '
+                'echo "[worker] hostname=$(hostname) HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-<unset>}"; '
+                'echo "HF_HOME=$HF_HOME"; '
+                'echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; '
+                'exec "$PYEXE" -u -m src.omnifed.execution.slurm.torchtitan_worker --cfg-json "$CFG_JSON"'
+            )
+        )
+
+        lines = ["#!/bin/bash"]
+        lines += sconf.sbatch_lines()
+        lines += ["set -euo pipefail"]
+
+        if sconf.setup_lines:
+            lines += sconf.setup_lines + [""]
+
+        lines += [
+            f'export PYTHONPATH="{sconf.work_dir}:${{PYTHONPATH:-}}"',
+            f'export PYEXE="${{PYEXE:-{pyexe}}}"',
+            'mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")',
+            'SERVER_HOST="${HOSTS[0]}"',
+            f'export CFG_JSON="{sconf.cfg_json_path}"',
+            f'CHECKPOINT_ROOT="{checkpoint_root}/job_${{SLURM_JOB_ID}}"',
+            'mkdir -p "$CHECKPOINT_ROOT"',
+            "",
+            
+            # Start the federated server in the background.
+            'srun --exclusive --nodes=1 --ntasks=1 '
+            '--nodelist="$SERVER_HOST" '
+            'env OMNIFED_ROLE=server '
+            'FEDERATED_RANK=0 '
+            'CHECKPOINT_ROOT="$CHECKPOINT_ROOT" '
+            f'{worker_entrypoint} &',
+            
+            # Wait until the gRPC server is accepting connections.
+            "",
+            f'SERVER_PORT={server_port}',
+            'SERVER_READY=0',
+            'echo "[setup] waiting for gRPC server at ${SERVER_HOST}:${SERVER_PORT}"',
+
+            'for attempt in $(seq 1 120); do',
+            '    if timeout 2 bash -c "</dev/tcp/${SERVER_HOST}/${SERVER_PORT}" 2>/dev/null; then',
+            '        SERVER_READY=1',
+            '        echo "[setup] gRPC server is reachable"',
+            '        break',
+            '    fi',
+            '    echo "[setup] server not ready: attempt ${attempt}/120"',
+            '    sleep 5',
+            'done',
+
+            'if [ "$SERVER_READY" -ne 1 ]; then',
+            '    echo "[setup] ERROR: gRPC server did not become ready"',
+            '    exit 1',
+            'fi',
+            "",
+        ]
+
+        for client_id in range(num_clients):
+            first_node = 1 + client_id * nodes_per_client
+            world_size = nodes_per_client * gpus_per_node
+
+            lines += [
+                f'CLIENT_{client_id}_NODES=$(IFS=,; echo "${{HOSTS[*]:{first_node}:{nodes_per_client}}}")',
+                f'CLIENT_{client_id}_MASTER="${{HOSTS[{first_node}]}}"',
+                #'export TORCH_NCCL_DESYNC_DEBUG=1',
+                #'export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576',
+                #'export NCCL_DEBUG=INFO',
+                #'export NCCL_DEBUG_SUBSYS=INIT,COLL',
+                (
+                    f"srun --exclusive --nodes={nodes_per_client} "
+                    f"--ntasks={world_size} --ntasks-per-node={gpus_per_node} "
+                    #"--gpus-per-task=1 --gpu-bind=closest "
+                    f'--nodelist="$CLIENT_{client_id}_NODES" '
+                    f'env OMNIFED_ROLE=client '
+                    f'CLIENT_ID={client_id} '
+                    f'FEDERATED_RANK={client_id + 1} '
+                    f'CLIENT_LEADER_RANK={leader_rank} '
+                    f'CLIENT_MASTER_ADDR="$CLIENT_{client_id}_MASTER" '
+                    f'CLIENT_MASTER_PORT={master_port_base + client_id} '
+                    f'SERVER_ADDR="$SERVER_HOST" '
+                    f'CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_{client_id}" '
+                    f'{worker_entrypoint} &'
+                ),
+            ]
+
+        lines += [
+            "wait",
+            'echo "All Torchtitan subclusters completed"',
+        ]
+
+        script_path = os.path.join(
+            sconf.work_dir, "omnifed_torchtitan_slurm.sh"
+        )
+
+        with open(script_path, "w") as file:
+            file.write("\n".join(lines) + "\n")
+
+        os.chmod(script_path, 0o755)
+        response = subprocess.check_output(
+            ["sbatch", script_path], text=True
+        ).strip()
+        print(response)
+        raise SystemExit(0)

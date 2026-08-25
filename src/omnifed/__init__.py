@@ -14,4 +14,5 @@
 
 from . import utils
 from .engine import Engine, EngineConfig, RayConfig
-from .node import Node, NodeConfig, RayActorConfig
+from .execution.config import NodeConfig, RayActorConfig
+from .execution.ray.actor import RayActor

@@ -702,39 +702,9 @@ class BaseAlgorithm(RequiredSetup, LifecycleHooks, MetricLogger):
         # All nodes enter synchronized epoch loop structure
         self.local_model.train()  # Future: .eval() for evaluation phases
 
-        # for epoch_idx in range(self.group_max_epochs_per_round):
-        #     # Run epoch training (timing handled by decorator)
-        #     self.__train_epoch(epoch_idx)
-
-        if getattr(self, "use_torchtitan_backend", False) and getattr(
-            self, "torchtitan_backend", None
-        ) is not None:
-            result = self.torchtitan_backend.train_local_steps(
-                steps=self.group_max_epochs_per_round
-            )
-
-            samples_trained = int(result.get("samples_trained", result.get("steps_run", 1)))
-
-            group_total_samples = self.local_comm.aggregate(
-                torch.tensor([samples_trained], dtype=torch.float32, device=next(self.local_model.parameters()).device),
-                reduction=AggregationOp.SUM,
-            ).item()
-
-            weight = samples_trained / max(group_total_samples, 1)
-
-            self.torchtitan_backend.aggregate_model(
-                comm=self.local_comm,
-                weight=weight,
-            )
-
-            self.torchtitan_backend.export_update(round_id=round_idx)
-
-        else:
-            for epoch_idx in range(self.group_max_epochs_per_round):
-                self.__train_epoch(epoch_idx)
-
-            if self.schedules.aggregation.round_end():
-                self.__sync()
+        for epoch_idx in range(self.group_max_epochs_per_round):
+            # Run epoch training (timing handled by decorator)
+            self.__train_epoch(epoch_idx)
 
         # Round-level aggregation
         if self.schedules.aggregation.round_end():
