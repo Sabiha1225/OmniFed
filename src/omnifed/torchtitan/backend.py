@@ -22,7 +22,7 @@ from torch.distributed.checkpoint.format_utils import (
 # )
 
 from contextlib import nullcontext
-from src.omnifed.timing import profile_torchtitan_communication
+from .profiling import profile_torchtitan_communication
 
 
 

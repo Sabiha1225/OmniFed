@@ -23,7 +23,7 @@ from src.omnifed.execution.slurm.frozen_config import (
     load_frozen_run_config,
     parse_frozen_config_argument,
 )
-from src.omnifed.timing import TimingRecorder
+from src.omnifed.torchtitan.profiling import TimingRecorder
 from src.omnifed.torchtitan import (
     ModelStateChunkAssembler,
     TorchTitanRole,
