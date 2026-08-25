@@ -19,7 +19,7 @@ from typing import Dict, TypeVar
 import torch
 import torch.nn as nn
 
-from ..utils import RequiredSetup
+from ..utils import MetricLogger, RequiredSetup
 
 # ======================================================================================
 
@@ -61,6 +61,11 @@ class BaseCommunicator(RequiredSetup, ABC):
         self.world_size = world_size
         self.master_addr = master_addr
         self.master_port = master_port
+        self.logger: MetricLogger | None = None
+
+    def set_logger(self, logger: MetricLogger) -> None:
+        """Attach the algorithm metric logger to this communicator."""
+        self.logger = logger
 
     @abstractmethod
     def broadcast(
