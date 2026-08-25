@@ -100,6 +100,57 @@ class RayRuntime:
 
         return ray_config
 
+    def _configure_torchdist_master(self) -> None:
+        """
+        Discover the Ray node hosting TorchDist local rank 0 and use its
+        reachable IP address as MASTER_ADDR for every actor.
+
+        This implementation is for a centralized topology containing one
+        TorchDist process group and exactly one local rank 0.
+        """
+        identity_futures = [
+            actor.get_runtime_identity.remote()
+            for actor in self.actor_refs
+        ]
+
+        identities = ray.get(identity_futures)
+
+        rank_zero_identities = [
+            identity
+            for identity in identities
+            if int(identity["local_rank"]) == 0
+        ]
+
+        if len(rank_zero_identities) != 1:
+            raise RuntimeError(
+                "Centralized Ray TorchDist execution requires exactly one "
+                f"local rank 0, but found {len(rank_zero_identities)}: "
+                f"{rank_zero_identities}"
+            )
+
+        master_identity = rank_zero_identities[0]
+        master_addr = str(master_identity["node_ip"])
+
+        if not master_addr:
+            raise RuntimeError(
+                "Ray rank-0 actor returned an empty node IP address."
+            )
+
+        print(
+            "Automatically selected TorchDist master: "
+            f"actor={master_identity['name']}, "
+            f"rank={master_identity['local_rank']}, "
+            f"address={master_addr}",
+            flush=True,
+        )
+
+        configure_futures = [
+            actor.set_local_master_addr.remote(master_addr)
+            for actor in self.actor_refs
+        ]
+
+        ray.get(configure_futures)
+
     def setup(self) -> None:
         ray.init(
             **self._ray_init_config()
@@ -196,6 +247,11 @@ class RayRuntime:
                 gpus_per_actor
             )
         )
+
+        # Actors now exist and Ray has placed them on physical nodes.
+        # Discover the node hosting TorchDist rank 0 before initializing
+        # the process group.
+        self._configure_torchdist_master()
 
         setup_futures = [
             actor.setup.remote(

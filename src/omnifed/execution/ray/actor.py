@@ -105,6 +105,39 @@ class RayActor(RequiredSetup):
         # Deferred instantiation
         self.__device: Optional[torch.device] = None
 
+
+    def get_runtime_identity(self) -> Dict[str, Any]:
+        """
+        Return the actor's TorchDist rank and its Ray-node IP address.
+
+        This is called before communicator setup so the runtime can discover
+        where local rank 0 was scheduled.
+        """
+        return {
+            "name": self.name,
+            "local_rank": int(self.local_comm.rank),
+            "node_ip": ray.util.get_node_ip_address(),
+        }
+
+    def set_local_master_addr(self, master_addr: str) -> None:
+        """
+        Set the TorchDist rendezvous address before process-group setup.
+        """
+        if self.local_comm.is_ready:
+            raise RuntimeError(
+                "Cannot change local_comm.master_addr after communicator setup."
+            )
+
+        self.local_comm.master_addr = str(master_addr)
+
+        print(
+            f"Configured local TorchDist master: "
+            f"rank={self.local_comm.rank}, "
+            f"master_addr={self.local_comm.master_addr}, "
+            f"master_port={self.local_comm.master_port}",
+            flush=True,
+        )
+
     def _setup(self, total_rounds: int) -> None:
         """
         Instantiate remaining components and establish connections.
