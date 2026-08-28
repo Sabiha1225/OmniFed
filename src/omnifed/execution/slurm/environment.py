@@ -5,6 +5,7 @@ def build_frontier_setup_lines() -> list[str]:
     return [
         "module load PrgEnv-gnu/8.6.0",
         "module load rocm/6.4.1",
+        "module load rccl-net-plugin",
         "module load craype-accel-amd-gfx90a",
         "",
         (
