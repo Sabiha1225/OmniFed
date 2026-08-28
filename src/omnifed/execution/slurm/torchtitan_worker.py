@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -224,31 +223,8 @@ def run_torchtitan_client(
     initial_path, initial_ready_path = get_initial_model_paths(cfg)
 
     try:
-        # Client 0 collectively creates the initial TorchTitan model.
-        if role.client_id == 0:
-            initial_result = backend.save_and_consolidate(
-                round_id=-1,
-                num_tokens=0,
-            )
-
-            if role.is_client_leader:
-                initial_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                temporary_path = initial_path.with_suffix(".tmp")
-
-                shutil.copyfile(
-                    initial_result["checkpoint_path"],
-                    temporary_path,
-                )
-                os.replace(temporary_path, initial_path)
-
-                # Publish only after model.pt is completely written.
-                initial_ready_path.touch()
-
-        # Other clients wait for client 0 to publish the model.
+        # The federated server owns initialization.  Every client, including
+        # client 0, waits for the same atomically published global model.
         wait_for_file(initial_ready_path)
 
         # Every rank within this subcluster reaches this point.
@@ -443,15 +419,31 @@ def run_torchtitan_federated_server(
 
     initial_path, initial_ready_path = get_initial_model_paths(cfg)
 
-    wait_for_file(initial_ready_path)
+    with timer.measure("server_initialize_global_model", "initial"):
+        backend = create_torchtitan_backend(cfg=cfg)
+        global_state = backend.initialize_global_model_on_cpu()
 
-    with timer.measure("server_load_initial_global_model", "initial"):
-        initial = torch.load(
-            initial_path,
-            map_location="cpu",
-            weights_only=False,
+        initial_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
-        global_state = initial.get("model", initial)
+        temporary_path = initial_path.with_suffix(".tmp")
+        torch.save(
+            {
+                "model": global_state,
+                "initialized_by": "server",
+            },
+            temporary_path,
+        )
+        os.replace(temporary_path, initial_path)
+
+        # Clients may only load after the complete checkpoint is visible.
+        initial_ready_path.touch()
+
+    print(
+        f"[server] published initial global model: {initial_path}",
+        flush=True,
+    )
 
     chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
 

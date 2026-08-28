@@ -275,12 +275,28 @@ class TorchTitanBackend:
         if self._trainer is not None:
             return self._trainer
 
+        config, output_dir = self._build_torchtitan_config()
+
+        try:
+            from torchtitan.trainer import Trainer
+        except Exception as exc:  # pragma: no cover - environment-dependent import
+            raise RuntimeError(
+                "Torchtitan is not installed or not importable. "
+                "Install it under the sibling torchtitan workspace and ensure the package is on PYTHONPATH."
+            ) from exc
+
+        self._config = config
+        self._trainer = Trainer(config)
+        self._trainer.config.dump_folder = str(output_dir)
+        return self._trainer
+
+    def _build_torchtitan_config(self) -> tuple[Any, Path]:
+        """Build the TorchTitan config without initializing distributed state."""
         config_spec = self._resolve_config()
         self._add_torchtitan_to_path(config_spec["root"])
 
         try:
             from torchtitan.config.manager import ConfigManager
-            from torchtitan.trainer import Trainer
         except Exception as exc:  # pragma: no cover - environment-dependent import
             raise RuntimeError(
                 "Torchtitan is not installed or not importable. "
@@ -355,10 +371,53 @@ class TorchTitanBackend:
         if config_spec.get("dataset_path"):
             config.dataloader.dataset_path = config_spec["dataset_path"]
         config.dump_folder = str(output_dir)
-        self._config = config
-        self._trainer = Trainer(config)
-        self._trainer.config.dump_folder = str(output_dir)
-        return self._trainer
+        return config, output_dir
+
+    def initialize_global_model_on_cpu(self) -> dict[str, torch.Tensor]:
+        """Create the authoritative unsharded initial model on the server.
+
+        This deliberately avoids ``Trainer`` because constructing a trainer
+        initializes the clients' distributed PP/TP process groups.  The
+        server owns an ordinary CPU model and publishes its state for every
+        client subcluster to convert to DCP and load.
+        """
+        config, _ = self._build_torchtitan_config()
+
+        try:
+            from torchtitan.config import TORCH_DTYPE_MAP
+            from torchtitan.tools import utils as torchtitan_utils
+        except Exception as exc:  # pragma: no cover - environment-dependent import
+            raise RuntimeError(
+                "Torchtitan is not installed or not importable."
+            ) from exc
+
+        model_spec = config.model_spec
+        if model_spec is None:
+            raise RuntimeError("TorchTitan config did not provide a model_spec")
+
+        model_config = model_spec.model
+        model_config.update_from_config(config=config)
+
+        seed = getattr(config.debug, "seed", None)
+        torch.manual_seed(0 if seed is None else int(seed))
+
+        dtype = TORCH_DTYPE_MAP[config.training.dtype]
+        with (
+            torch.device("meta"),
+            torchtitan_utils.set_default_dtype(dtype),
+        ):
+            model = model_config.build()
+
+        model.to_empty(device="cpu")
+        with torch.no_grad():
+            model.init_weights(buffer_device=None)
+
+        # state_dict values retain the model storage, so no second 8B-model
+        # copy is created on the server.
+        return {
+            name: value.detach().cpu()
+            for name, value in model.state_dict().items()
+        }
 
     def train_local_steps(
         self,
