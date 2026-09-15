@@ -204,6 +204,10 @@ class RayActor(RequiredSetup):
             int(group_max_epochs_and_iters["epochs_per_round"].item()),
             total_rounds,
         )
+        if self.global_comm:
+            self.global_comm.set_logger(self.algorithm)
+        
+        self.local_comm.set_logger(self.algorithm)
 
         if self.global_comm:
             self.global_comm.set_logger(self.algorithm)

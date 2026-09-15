@@ -15,6 +15,7 @@
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, TypeVar
+# from ..algorithm import BaseAlgorithm
 
 import torch
 import torch.nn as nn
@@ -67,6 +68,9 @@ class BaseCommunicator(RequiredSetup, ABC):
         """Attach the algorithm metric logger to this communicator."""
         self.logger = logger
 
+    def set_logger(self, logger: MetricLogger):
+        self.logger = logger
+
     @abstractmethod
     def broadcast(
         self,
@@ -102,6 +106,7 @@ class BaseCommunicator(RequiredSetup, ABC):
             Same message type with aggregated values
         """
         pass
+    
 
     @abstractmethod
     def close(self):

@@ -22,7 +22,18 @@ import torch
 
 from ..utils import print
 from . import AggregationOp, grpc_pb2, grpc_pb2_grpc
-from .utils import get_msg_info, proto_to_tensordict, tensordict_to_proto
+from .utils import get_msg_info, proto_to_tensordict, tensordict_to_proto, proto_to_tensordict_extended
+from .compression.sparsification import *
+from .compression.quantization import *
+from .compression.lowrank_approximation import *
+from .utils import compress_message_tensors, extract_tensordict
+from ..utils import MetricLogger
+# from ..logger import Baselogger
+
+from contextlib import nullcontext
+import torch
+import torch.nn as nn
+
 
 
 @rich.repr.auto
@@ -47,6 +58,7 @@ class GrpcClient:
         retry_delay: float = 5.0,
         max_retries: int = 3,
         client_timeout: float = 60,
+        compressor=None
     ):
         """
         Initialize gRPC client with connection and retry settings.
@@ -72,6 +84,11 @@ class GrpcClient:
         self.retry_delay = retry_delay
         self.max_retries = max_retries
         self.client_timeout = client_timeout
+        # self.compressor = TopKCompression(compress_ratio=0.01)
+        self.compressor = compressor
+        # self.compressor = None
+        self.last_tensordict_submitted = None
+        self.logger = None
 
         # Initialize connection state
         self.channel = None
@@ -79,6 +96,9 @@ class GrpcClient:
 
         # Establish connection with retry logic
         self._establish_connection()
+
+    def set_logger(self, logger: MetricLogger):
+        self.logger = logger
 
     def _establish_connection(self):
         """Establish gRPC connection with retry logic."""
@@ -133,7 +153,11 @@ class GrpcClient:
                 request = grpc_pb2.ClientInfo(client_id=self.client_id)
                 response = self.stub.GetBroadcastState(request)
                 if response.is_ready:
+                    print(f"Retrieving response on the client side; client_id = {self.client_id}")
                     tensordict = proto_to_tensordict(response.tensor_dict)
+                    with torch.no_grad():
+                        for key, tensor in tensordict.items():
+                            pass
                     print(f"Received {get_msg_info(tensordict)}")
                     return tensordict
                 poll_count += 1
@@ -182,6 +206,7 @@ class GrpcClient:
             print("Successfully sent local model to server")
         # except grpc.RpcError as e:
         #     print(f"Submit exception | {e}")
+
         except grpc.RpcError as e:
             raise RuntimeError(
                 f"Failed to submit aggregation data for client "
@@ -215,9 +240,21 @@ class GrpcClient:
                 raise RuntimeError(f"Aggregation timeout ({self.client_timeout}s)")
             try:
                 request = grpc_pb2.ClientInfo(client_id=self.client_id)
-                response = self.stub.GetAggregationResult(request)
+                # downstream_start = time.time()
+                ctx = self.logger.log_duration("training_downstream_download_time") if self.logger else nullcontext()
+                with ctx:
+                    response = self.stub.GetAggregationResult(request)
+                # downstream_end = time.time()
                 if response.is_ready:
-                    tensordict = proto_to_tensordict(response.tensor_dict)
+                    # downstream_time_break_down = {'comm': [], 'decode': []}
+                    # downstream_time_break_down['comm'] = downstream_end - downstream_start 
+                    # decompression_start = time.time()
+                    ctx = self.logger.log_duration("training_decompression_time") if self.logger else nullcontext()
+                    with ctx:
+                        tensordict, is_model_communicated = proto_to_tensordict_extended(response.tensor_dict, self.last_tensordict_submitted)
+                    # decompression_end = time.time()
+                    # downstream_time_break_down['decode'] = decompression_end - decompression_start
+                    # timing['downstream'].append(downstream_time_break_down)
                     print(
                         f"Received {get_msg_info(tensordict)} (waited {elapsed:.1f}s)"
                     )

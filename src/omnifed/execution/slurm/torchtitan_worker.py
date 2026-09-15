@@ -448,25 +448,45 @@ def run_torchtitan_federated_server(
     chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
 
     for round_id in range(int(cfg.global_rounds)):
-        # Make the current global state available to client leaders.
-        # communicator.broadcast(global_state)
-
-        # Server participates with zero samples and zero-valued tensors.
+        # Existing collective: clients contribute their training token counts.
+        # No algorithm result processor is installed for this collective.
         with timer.measure("server_collect_token_counts", round_id):
             communicator.aggregate(
                 torch.tensor([0.0], dtype=torch.float64),
                 AggregationOp.SUM,
             )
 
-        # new_global_state = {}
         assembler = ModelStateChunkAssembler(global_state)
 
-        for chunk_id, chunk in enumerate(iter_model_state_chunks(global_state, chunk_size)):
-            server_chunk = (
-                federated_algorithm.prepare_server_chunk(
-                    chunk=chunk,
-                    round_id=round_id,
+        for chunk_id, chunk in enumerate(
+            iter_model_state_chunks(global_state, chunk_size)
+        ):
+            previous_chunk = {
+                name: tensor.detach().clone()
+                for name, tensor in chunk.items()
+            }
+
+            # Bind the current chunk and round explicitly.
+            def process_averaged_chunk(
+                averaged_parameters,
+                previous_parameters=previous_chunk,
+                current_round=round_id,
+            ):
+                return federated_algorithm.server_step(
+                    averaged_parameters=averaged_parameters,
+                    previous_global_parameters=previous_parameters,
+                    round_id=current_round,
                 )
+
+            # Register before rank 0 contributes, so the aggregation
+            # cannot publish an unprocessed result.
+            communicator.servicer.set_next_result_processor(
+                process_averaged_chunk
+            )
+
+            server_chunk = federated_algorithm.prepare_server_chunk(
+                chunk=chunk,
+                round_id=round_id,
             )
 
             with timer.measure(
@@ -477,27 +497,18 @@ def run_torchtitan_federated_server(
                     f"num_tensors={len(server_chunk)}"
                 ),
             ):
-                aggregated_chunk = communicator.aggregate(
+                updated_chunk = communicator.aggregate(
                     server_chunk,
                     AggregationOp.SUM,
                 )
-            # new_global_state.update(aggregated_chunk)
-            assembler.add_chunk(aggregated_chunk)
 
-        # Preserve the model that entered this round.
-        # FedMom, DiLoCo and similar algorithms may need it.
-        previous_global_state = global_state
+            # The gRPC clients received this same updated chunk.
+            assembler.add_chunk(updated_chunk)
 
-        # Reconstruct the state returned by federated aggregation.
-        aggregated_state = assembler.finish()
+        global_state = assembler.finish()
 
-        # Apply optional algorithm-specific server processing.
-        # FedAvg returns aggregated_state unchanged.
-        global_state = federated_algorithm.finalize_global_state(
-            aggregated_state=aggregated_state,
-            previous_global_state=previous_global_state,
-            round_id=round_id,
-        )
+        # Do not call finalize_global_state() here.
+        # Every server update has already happened before its response.
 
         with timer.measure("server_save_global_model", round_id):
             output = (
@@ -508,7 +519,21 @@ def run_torchtitan_federated_server(
                 / "model.pt"
             )
             output.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"model": global_state}, output)
+
+            temporary_output = output.with_suffix(".tmp")
+
+            torch.save(
+                {
+                    "model": global_state,
+                    "algorithm_name": federated_algorithm.name,
+                    "algorithm_state": federated_algorithm.state_dict(),
+                    "round_id": round_id,
+                    "grpc_chunk_size_mb": chunk_size,
+                },
+                temporary_output,
+            )
+
+            os.replace(temporary_output, output)
 
     communicator.close()
 

@@ -38,6 +38,14 @@ from .topology import (
     BaseTopology,
     BaseTopologyConfig,
 )
+# from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
+from omegaconf import OmegaConf
+
+from .slurm_launcher import SlurmConfig, SlurmOnlyLauncher
+from .engine_communication import communication_mode, resolve_slurm_ntasks
+import sys
+import shlex
 
 @dataclass
 class RayConfig:
