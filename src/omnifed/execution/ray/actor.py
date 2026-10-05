@@ -39,8 +39,6 @@ from ...model import ModelConfig
 from ...utils import RequiredSetup, print
 
 
-
-
 @ray.remote
 class RayActor(RequiredSetup):
     """
@@ -66,6 +64,7 @@ class RayActor(RequiredSetup):
         # ---
         log_dir_base: str,
         device_hint: str,
+        has_server: bool = True,
     ):
         """
         Initialize federated learning node with configs.
@@ -100,6 +99,14 @@ class RayActor(RequiredSetup):
             algorithm,
             log_dir=self.log_dir,
         )
+
+        if os.environ.get("OMNIFED_FEDERATED_CLIENT_INDEX") in (None, ""):
+            comm_rank = int(self.local_comm.rank)
+            world = int(self.local_comm.world_size)
+            n_trainers = max(world - 1, 1) if has_server else world
+            apply_federated_shard_env(
+                rank=comm_rank, num_trainers=n_trainers, has_server=has_server
+            )
 
         self.datamodule: DataModule = instantiate(datamodule)
         # Deferred instantiation
@@ -146,7 +153,7 @@ class RayActor(RequiredSetup):
         Instantiates model, establishes communicator connections,
         and passes dependencies to algorithm.
         """
-        model: nn.Module = instantiate(self.model_cfg)
+        model, model_load_s = instantiate_model_timed(self.model_cfg)
 
         # Establish communicator connections
         self.local_comm.setup()
@@ -154,7 +161,14 @@ class RayActor(RequiredSetup):
             self.global_comm.setup()
         
         self.original_device = next(model.parameters()).device
-        model = model.to(self.device)
+        model, model_to_device_s = move_model_to_device_timed(model, self.device)
+        emit_model_startup(
+            rank=int(self.local_comm.rank),
+            log_dir=self.log_dir,
+            model_load_s=model_load_s,
+            model_to_device_s=model_to_device_s,
+            algorithm=self.algorithm,
+        )
 
         # Standard federated learning setup: broadcast initial model from server
         # In hierarchical topologies: global comm first, then local comm

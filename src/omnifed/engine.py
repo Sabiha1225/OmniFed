@@ -27,25 +27,20 @@ from omegaconf import MISSING, OmegaConf
 from . import utils
 from .algorithm import BaseAlgorithmConfig
 from .data import DataModuleConfig
-from .execution import validate_execution_combination
+from .engine_communication import is_hierarchical_cfg
+from .execution import uses_torchtitan, validate_execution_mode
 from .execution.ray.runtime import RayRuntime
 from .execution.slurm.config import SlurmConfig
 from .execution.slurm.runtime import SlurmRuntime
 from .model import ModelConfig
+from .topology import BaseTopology, BaseTopologyConfig
 from .utils import RequiredSetup, ResultsDisplay, print
 
-from .topology import (
-    BaseTopology,
-    BaseTopologyConfig,
-)
-# from dataclasses import asdict
 from dataclasses import asdict, is_dataclass
 from omegaconf import OmegaConf
-
-from .slurm_launcher import SlurmConfig, SlurmOnlyLauncher
-from .engine_communication import communication_mode, resolve_slurm_ntasks
 import sys
 import shlex
+
 
 @dataclass
 class RayConfig:
@@ -125,7 +120,13 @@ class EngineConfig:
     # Infrastructure configurations
     ray: RayConfig = field(default_factory=RayConfig)
     slurm: SlurmConfig = field(default_factory=SlurmConfig)
-    engine: Dict[str, str] = field(default_factory=lambda: {"mode": "ray"})  # 'ray' or 'slurm'
+    # mode: ray | slurm. Topology selects hops. Titan is the client (torchtitan.module).
+    engine: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "mode": "ray",
+        }
+    )
+
 
 # Register the config with Hydra's ConfigStore for structured configs
 cs = ConfigStore.instance()
@@ -136,125 +137,41 @@ class Engine(RequiredSetup):
     """
     Main engine for federated learning experiments.
 
-    Coordinates distributed Ray actors (nodes) to run FL algorithms across different topologies.
-    Handles experiment setup, execution, and results collection with automatic
-    GPU allocation and output management.
-
-    Use this as the main entry point for running FL experiments with Hydra configurations.
-    See working examples in the conf/ directory.
+    Phase 1: thin dispatcher. ``engine.mode=ray`` uses RayRuntime;
+    ``engine.mode=slurm`` uses SlurmRuntime then ``slurm_worker``.
     """
 
     def __init__(
         self,
         cfg: EngineConfig,
-    ) -> None:
+    ):
         super().__init__()
         utils.print_rule()
 
         self.cfg = cfg
         self.hydra_cfg = HydraConfig.get()
 
-        self.execution_mode = self._get_execution_mode()
-        self.backend_name = self._get_backend_name()
+        self.uses_torchtitan: bool = uses_torchtitan(cfg)
+        if cfg.topology is None:
+            raise ValueError(
+                "topology is required (centralized or decentralized). "
+                "Titan is the client, not topology: null."
+            )
+        self.topology: BaseTopology = instantiate(cfg.topology, _recursive_=False)
+        self.global_rounds: int = cfg.global_rounds
+        self.overwrite: bool = cfg.overwrite
 
-        validate_execution_combination(
-            execution_mode=self.execution_mode,
-            backend_name=self.backend_name,
-        )
+        self.ray_cfg: RayConfig = cfg.ray
 
         self.global_rounds = int(cfg.global_rounds)
         self.overwrite = bool(cfg.overwrite)
 
-        self.output_dir = (
-            self.hydra_cfg.runtime.output_dir
+        self._results_display: ResultsDisplay = ResultsDisplay()
+        self.execution_mode: str = validate_execution_mode(
+            OmegaConf.select(self.cfg, "engine.mode", default="ray")
         )
-        self.engine_dir = os.path.join(
-            self.output_dir,
-            "engine",
-        )
-        self.results_dir = os.path.join(
-            self.engine_dir,
-            "node_results",
-        )
-
-        self.repo_root = os.path.abspath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-            )
-        )
-
-        self.topology: Optional[BaseTopology] = (
-            self._create_topology()
-        )
-
-        self._results_display = ResultsDisplay()
         self.ray_runtime: Optional[RayRuntime] = None
         self.slurm_runtime: Optional[SlurmRuntime] = None
-
-    def _get_execution_mode(self) -> str:
-        return str(
-            OmegaConf.select(
-                self.cfg,
-                "engine.mode",
-                default="ray",
-            )
-        ).lower()
-
-    def _get_backend_name(self) -> str:
-        return str(
-            OmegaConf.select(
-                self.cfg,
-                "backend.internal_backend",
-                default="torchdist",
-            )
-        ).lower()
-
-    def _create_topology(
-        self,
-    ) -> Optional[BaseTopology]:
-        if self.backend_name != "torchdist":
-            return None
-
-        topology_config = OmegaConf.select(
-            self.cfg,
-            "topology",
-            default=None,
-        )
-
-        if topology_config is None:
-            raise ValueError(
-                "TorchDist execution requires a topology"
-            )
-
-        topology = instantiate(
-            topology_config,
-            _recursive_=False,
-        )
-
-        if not isinstance(topology, BaseTopology):
-            raise TypeError(
-                "Configured topology must be an instance of "
-                f"BaseTopology; got {type(topology).__name__}"
-            )
-
-        return topology
-
-    def _setup_topology(self) -> None:
-        if self.backend_name != "torchdist":
-            return
-
-        if self.topology is None:
-            raise RuntimeError(
-                "TorchDist execution requires a topology"
-            )
-
-        self.topology.setup(
-            default_algorithm_cfg=self.cfg.algorithm,
-            default_model_cfg=self.cfg.model,
-            default_datamodule_cfg=self.cfg.datamodule,
-        )
 
     def _setup_output_directories(self) -> None:
         """
@@ -263,7 +180,6 @@ class Engine(RequiredSetup):
         Creates engine/ and node_results/ directories under Hydra's output path.
         Issues warnings if conflicting experiment files already exist unless overwrite=True.
         """
-        # Check for pre-existing files that could overwrite results (ignore Hydra standard files)
         if os.path.exists(self.output_dir):
             hydra_standard_files = {".hydra", "main.log", ".gitignore"}
             existing_files = [
@@ -287,10 +203,8 @@ class Engine(RequiredSetup):
                         f"Use a fresh Hydra output directory, clean the existing one, or set overwrite=true."
                     )
 
-        # Create engine directory
         os.makedirs(self.engine_dir, exist_ok=True)
 
-        # Check if engine directory is not empty (indicates conflicting experiment)
         if os.path.exists(self.engine_dir):
             existing_files = [
                 f for f in os.listdir(self.engine_dir) if not f.startswith(".")
@@ -318,61 +232,55 @@ class Engine(RequiredSetup):
         self._setup_output_directories()
         self._setup_topology()
 
-        os.environ["OMNIFED_INTERNAL_BACKEND"] = (
-            self.backend_name
-        )
-
-        if self.execution_mode == "ray":
-            self._setup_ray()
-            return
-
-        if self.execution_mode == "slurm":
-            self._setup_slurm()
-            return
-
-        raise ValueError(
-            "Unsupported execution mode: "
-            f"{self.execution_mode!r}"
-        )
-
-    def _setup_ray(self) -> None:
-        if self.topology is None:
-            raise RuntimeError(
-                "Ray execution requires an OmniFed topology"
+        mode = self.execution_mode
+        if self.uses_torchtitan:
+            if mode != "slurm":
+                raise ValueError(
+                    "A Titan client (torchtitan.module) is only valid with engine.mode=slurm."
+                )
+        else:
+            self.topology.setup(
+                default_algorithm_cfg=self.cfg.algorithm,
+                default_model_cfg=self.cfg.model,
+                default_datamodule_cfg=self.cfg.datamodule,
             )
+
+        if is_hierarchical_cfg(self.cfg) and mode != "slurm":
+            raise ValueError(
+                "topology: hierarchical is only valid with engine.mode=slurm."
+            )
+        if is_hierarchical_cfg(self.cfg) and self.uses_torchtitan:
+            raise ValueError(
+                "TorchTitan is not wired to hierarchical yet. "
+                "Use 1-GPU clients with topology: hierarchical."
+            )
+
+        if mode == "slurm":
+            repo_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..")
+            )
+            self.slurm_runtime = SlurmRuntime(
+                cfg=self.cfg,
+                hydra_cfg=self.hydra_cfg,
+                topology=self.topology,
+                output_dir=self.output_dir,
+                engine_dir=self.engine_dir,
+                repo_root=repo_root,
+            )
+            self.slurm_runtime.setup()
+            return
 
         self.ray_runtime = RayRuntime(
             cfg=self.cfg,
             hydra_cfg=self.hydra_cfg,
             topology=self.topology,
             results_display=self._results_display,
+            engine_dir=self.engine_dir,
+            results_dir=self.results_dir,
         )
-
         self.ray_runtime.setup()
 
-    def _setup_slurm(self) -> None:
-        self.slurm_runtime = SlurmRuntime(
-            cfg=self.cfg,
-            hydra_cfg=self.hydra_cfg,
-            topology=self.topology,
-            backend_name=self.backend_name,
-            output_dir=self.output_dir,
-            engine_dir=self.engine_dir,
-            repo_root=self.repo_root,
-        )
-
-        self.slurm_runtime.setup()
-        
     def run_experiment(self) -> None:
-        """
-        Start experiment execution after Engine setup.
-
-        Ray execution remains in the parent process, so training is
-        delegated to RayRuntime here.
-
-        Slurm submission exits during setup(), and training is later
-        performed by the generated Slurm worker.
-        """
         if self.execution_mode != "ray":
             raise RuntimeError(
                 "run_experiment() is only reached for Ray execution. "
@@ -381,8 +289,7 @@ class Engine(RequiredSetup):
 
         if self.ray_runtime is None:
             raise RuntimeError(
-                "Ray runtime is not initialized. "
-                "Call engine.setup() first."
+                "Ray runtime is not initialized. Call engine.setup() first."
             )
 
         self.ray_runtime.run_experiment()

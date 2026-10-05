@@ -4,7 +4,8 @@ defaults:
 
 _target_: src.omnifed.algorithm_torchtitan.DiLoCo
 
-num_clients: ${torchtitan.subclusters.num_clients}
+# num_clients: ${torchtitan.subclusters.num_clients}
+num_clients: ${topology.num_clients}
 
 outer_lr: 0.7
 outer_momentum: 0.9

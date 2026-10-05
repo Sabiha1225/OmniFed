@@ -35,6 +35,12 @@ class TorchTitanSlurmLauncher:
                 "num_clients must be positive"
             )
 
+        if "has_server" not in launcher_cfg:
+            raise ValueError(
+                "has_server is required (from topology.has_server)"
+            )
+        federated = bool(launcher_cfg["has_server"])
+
         nodes_per_client = int(
             subclusters["nodes_per_client"]
         )
@@ -81,6 +87,8 @@ class TorchTitanSlurmLauncher:
                 'fi; '
                 'unset ROCR_VISIBLE_DEVICES; '
                 'export HF_HOME="/mnt/bb/${USER}/hf_cache/${SLURM_JOB_ID}/rank_${SLURM_PROCID}"; '
+                # 'export OMNIFED_PROFILE_TORCH_COMM="${OMNIFED_PROFILE_TORCH_COMM:-0}"; '
+                # f'export HF_HOME="{checkpoint_root}/hf_cache"; '
                 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"; '
                 'export TRANSFORMERS_CACHE="${HF_HOME}/transformers"; '
                 'mkdir -p "$HF_DATASETS_CACHE" "$TRANSFORMERS_CACHE"; '
@@ -88,6 +96,10 @@ class TorchTitanSlurmLauncher:
                 'echo "HF_HOME=$HF_HOME"; '
                 'echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; '
                 'exec "$PYEXE" -u -m src.omnifed.execution.slurm.torchtitan_worker --cfg-json "$CFG_JSON"'
+                # 'echo "[worker] OMNIFED_PROFILE_TORCH_COMM=${OMNIFED_PROFILE_TORCH_COMM:-<unset>}"; '
+                # 'echo "HF_HOME=$HF_HOME"; '
+                # 'echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"; '
+                # 'exec "$PYEXE" -u -m ' + TORCHTITAN_WORKER_MODULE + ' --cfg-json "$CFG_JSON"'
             )
         )
 
@@ -102,46 +114,56 @@ class TorchTitanSlurmLauncher:
             f'export PYTHONPATH="{sconf.work_dir}:${{PYTHONPATH:-}}"',
             f'export PYEXE="${{PYEXE:-{pyexe}}}"',
             'mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")',
-            'SERVER_HOST="${HOSTS[0]}"',
+            # 'SERVER_HOST="${HOSTS[0]}"',
             f'export CFG_JSON="{sconf.cfg_json_path}"',
             f'CHECKPOINT_ROOT="{checkpoint_root}/job_${{SLURM_JOB_ID}}"',
             'mkdir -p "$CHECKPOINT_ROOT"',
             "",
-            
-            # Start the federated server in the background.
-            'srun --exclusive --nodes=1 --ntasks=1 '
-            '--nodelist="$SERVER_HOST" '
-            'env OMNIFED_ROLE=server '
-            'FEDERATED_RANK=0 '
-            'CHECKPOINT_ROOT="$CHECKPOINT_ROOT" '
-            f'{worker_entrypoint} &',
-            
-            # Wait until the gRPC server is accepting connections.
-            "",
-            f'SERVER_PORT={server_port}',
-            'SERVER_READY=0',
-            'echo "[setup] waiting for gRPC server at ${SERVER_HOST}:${SERVER_PORT}"',
-
-            'for attempt in $(seq 1 120); do',
-            '    if timeout 2 bash -c "</dev/tcp/${SERVER_HOST}/${SERVER_PORT}" 2>/dev/null; then',
-            '        SERVER_READY=1',
-            '        echo "[setup] gRPC server is reachable"',
-            '        break',
-            '    fi',
-            '    echo "[setup] server not ready: attempt ${attempt}/120"',
-            '    sleep 5',
-            'done',
-
-            'if [ "$SERVER_READY" -ne 1 ]; then',
-            '    echo "[setup] ERROR: gRPC server did not become ready"',
-            '    exit 1',
-            'fi',
-            "",
         ]
 
+        if federated:
+            lines += [
+                'SERVER_HOST="${HOSTS[0]}"',
+                'srun --exclusive --nodes=1 --ntasks=1 '
+                '--nodelist="$SERVER_HOST" '
+                'env OMNIFED_ROLE=server '
+                'FEDERATED_RANK=0 '
+                'CHECKPOINT_ROOT="$CHECKPOINT_ROOT" '
+                f'{worker_entrypoint} &',
+                "",
+                f'SERVER_PORT={server_port}',
+                'SERVER_READY=0',
+                'echo "[setup] waiting for gRPC server at ${SERVER_HOST}:${SERVER_PORT}"',
+                'for attempt in $(seq 1 120); do',
+                '    if timeout 2 bash -c "</dev/tcp/${SERVER_HOST}/${SERVER_PORT}" 2>/dev/null; then',
+                '        SERVER_READY=1',
+                '        echo "[setup] gRPC server is reachable"',
+                '        break',
+                '    fi',
+                '    echo "[setup] server not ready: attempt ${attempt}/120"',
+                '    sleep 5',
+                'done',
+                'if [ "$SERVER_READY" -ne 1 ]; then',
+                '    echo "[setup] ERROR: gRPC server did not become ready"',
+                '    exit 1',
+                'fi',
+                "",
+            ]
+        else:
+            lines += [
+                'echo "[setup] topology has no server: no federated gRPC server srun"',
+                "",
+            ]
+
+        host0 = 1 if federated else 0
         for client_id in range(num_clients):
-            first_node = 1 + client_id * nodes_per_client
+            first_node = host0 + client_id * nodes_per_client
             world_size = nodes_per_client * gpus_per_node
+            server_env = (
+                'SERVER_ADDR="$SERVER_HOST" '
+                if federated
+                else ""
+            )
 
             lines += [
                 f'CLIENT_{client_id}_NODES=$(IFS=,; echo "${{HOSTS[*]:{first_node}:{nodes_per_client}}}")',
@@ -150,10 +172,10 @@ class TorchTitanSlurmLauncher:
                 #'export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576',
                 #'export NCCL_DEBUG=INFO',
                 #'export NCCL_DEBUG_SUBSYS=INIT,COLL',
+                #"--gpus-per-task=1 --gpu-bind=closest "
                 (
                     f"srun --exclusive --nodes={nodes_per_client} "
                     f"--ntasks={world_size} --ntasks-per-node={gpus_per_node} "
-                    #"--gpus-per-task=1 --gpu-bind=closest "
                     f'--nodelist="$CLIENT_{client_id}_NODES" '
                     f'env OMNIFED_ROLE=client '
                     f'CLIENT_ID={client_id} '
@@ -161,7 +183,7 @@ class TorchTitanSlurmLauncher:
                     f'CLIENT_LEADER_RANK={leader_rank} '
                     f'CLIENT_MASTER_ADDR="$CLIENT_{client_id}_MASTER" '
                     f'CLIENT_MASTER_PORT={master_port_base + client_id} '
-                    f'SERVER_ADDR="$SERVER_HOST" '
+                    f'{server_env}'
                     f'CLIENT_CHECKPOINT_ROOT="$CHECKPOINT_ROOT/client_{client_id}" '
                     f'{worker_entrypoint} &'
                 ),

@@ -8,6 +8,7 @@ import warnings
 from dataclasses import asdict, fields, is_dataclass
 from typing import Any
 
+
 import ray
 from omegaconf import OmegaConf
 from rich.pretty import pprint
@@ -27,6 +28,7 @@ LOG_FLUSH_DELAY = 2.0
 class RayRuntime:
     def __init__(
         self,
+
         cfg: Any,
         hydra_cfg: Any,
         topology: Any,
@@ -317,9 +319,9 @@ class RayRuntime:
             else:
                 node_kwargs = dict(node_config)
 
+
             print_rule()
             pprint(node_config)
-
             node_kwargs.pop(
                 "ray_actor_options",
                 None,
@@ -366,6 +368,7 @@ class RayRuntime:
                     result,
                     file,
                 )
+
 
     def run_experiment(self) -> None:
         try:

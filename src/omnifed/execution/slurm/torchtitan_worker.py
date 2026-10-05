@@ -18,6 +18,8 @@ from src.omnifed.communicator import (
 from src.omnifed.communicator.grpc import (
     GrpcCommunicator,
 )
+
+from src.omnifed.data.federated_shards import topology_has_server
 from src.omnifed.execution.slurm.frozen_config import (
     load_frozen_run_config,
     parse_frozen_config_argument,
@@ -77,7 +79,7 @@ def create_torchtitan_algorithm(
 def create_federated_communicator(cfg, federated_rank: int, server_addr: str):
     communicator = GrpcCommunicator(
         rank=federated_rank,
-        world_size=int(cfg.torchtitan.subclusters.num_clients) + 1,
+        world_size=int(cfg.topology.num_clients) + 1,
         master_addr=server_addr,
         master_port=int(cfg.torchtitan.federated.server_port),
         max_send_message_length=128 * 1024 * 1024,
@@ -213,7 +215,9 @@ def run_torchtitan_client(
     backend.timer = timer
 
     communicator = None
-    if role.is_client_leader:
+
+    federated = topology_has_server(cfg.topology)
+    if federated and role.is_client_leader:
         communicator = create_federated_communicator(
             cfg=cfg,
             federated_rank=role.federated_rank,
@@ -223,12 +227,28 @@ def run_torchtitan_client(
     initial_path, initial_ready_path = get_initial_model_paths(cfg)
 
     try:
+
         # The federated server owns initialization.  Every client, including
         # client 0, waits for the same atomically published global model.
-        wait_for_file(initial_ready_path)
+        # wait_for_file(initial_ready_path)
 
         # Every rank within this subcluster reaches this point.
         # dist.barrier()
+
+        if not federated and role.is_client_leader:
+            print(
+                f"[client {role.client_id}] topology has no server: no OmniFed gRPC; "
+                "leader publishes the initial model for this Titan",
+                flush=True,
+            )
+            global_state = backend.initialize_global_model_on_cpu()
+            initial_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = initial_path.with_suffix(".tmp")
+            torch.save({"model": global_state}, temporary_path)
+            os.replace(temporary_path, initial_path)
+            initial_ready_path.touch()
+
+        wait_for_file(initial_ready_path)
 
         print(
             f"[client {role.client_id} rank {role.torchtitan_rank}] "
@@ -237,6 +257,7 @@ def run_torchtitan_client(
         )
 
         # Load initial ordinary tensors into this client's PP/TP model.
+
         backend.load_global_model(
             model_path=str(initial_path),
             round_id=-1,
@@ -252,6 +273,7 @@ def run_torchtitan_client(
         # maybe_dist_barrier()
 
         # Round 0 starts from the initial globally shared model.
+
         current_global_model_path = str(initial_path)
 
         # Federated rounds.
@@ -296,31 +318,30 @@ def run_torchtitan_client(
             global_ready_path = global_path.with_suffix(".ready")
 
             if role.is_client_leader:
-                assert communicator is not None
-
-                # aggregated_state = run_client_global_communication(
-                #     cfg=cfg,
-                #     communicator=communicator,
-                #     result=local_result,
-                # )
-
-                with timer.measure(
-                    phase="grpc_round_communication_total",
-                    round_id=round_id,
-                    iteration="",
-                    global_step=int(train_result["step"]),
-                    extra=f"client_id={role.client_id}",
-                ):
-
-                    aggregated_state = exchange_model_with_federated_server(
-                        cfg=cfg,
-                        communicator=communicator,
-                        result=local_result,
-                        federated_algorithm=federated_algorithm,
-                        timer=timer,
+                if federated:
+                    assert communicator is not None
+                    with timer.measure(
+                        phase="grpc_round_communication_total",
                         round_id=round_id,
+                        iteration="",
                         global_step=int(train_result["step"]),
+                        extra=f"client_id={role.client_id}",
+                    ):
+                        aggregated_state = exchange_model_with_federated_server(
+                            cfg=cfg,
+                            communicator=communicator,
+                            result=local_result,
+                            federated_algorithm=federated_algorithm,
+                            timer=timer,
+                            round_id=round_id,
+                            global_step=int(train_result["step"]),
+                        )
+                else:
+                    payload = torch.load(
+                        local_result["checkpoint_path"],
+                        map_location="cpu",
                     )
+                    aggregated_state = payload["model"]
 
                 with timer.measure("client_write_global_tensor_model", round_id):
                     global_path.parent.mkdir(
@@ -450,6 +471,10 @@ def run_torchtitan_federated_server(
     for round_id in range(int(cfg.global_rounds)):
         # Existing collective: clients contribute their training token counts.
         # No algorithm result processor is installed for this collective.
+        # Make the current global state available to client leaders.
+        # communicator.broadcast(global_state)
+
+        # Server participates with zero samples and zero-valued tensors.
         with timer.measure("server_collect_token_counts", round_id):
             communicator.aggregate(
                 torch.tensor([0.0], dtype=torch.float64),
@@ -487,6 +512,7 @@ def run_torchtitan_federated_server(
             server_chunk = federated_algorithm.prepare_server_chunk(
                 chunk=chunk,
                 round_id=round_id,
+
             )
 
             with timer.measure(
@@ -497,6 +523,7 @@ def run_torchtitan_federated_server(
                     f"num_tensors={len(server_chunk)}"
                 ),
             ):
+
                 updated_chunk = communicator.aggregate(
                     server_chunk,
                     AggregationOp.SUM,

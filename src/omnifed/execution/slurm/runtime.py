@@ -6,22 +6,52 @@ from typing import Any, Optional
 
 from omegaconf import OmegaConf
 
+from ...engine_communication import is_hierarchical_cfg, resolve_slurm_ntasks
+from ...execution.shared import uses_torchtitan
+from src.omnifed.data.federated_shards import topology_has_server
+from .slurm_launcher import (
+    SlurmOnlyLauncher,
+    allocation_slot_count,
+    resolve_slurm_frozen_cfg_path,
+    tasks_per_allocated_node,
+)
+from ...utils import print
 from .config import SlurmConfig
 from .environment import build_frontier_setup_lines
-from .torchdist_launcher import TorchDistSlurmLauncher
 from .torchtitan_launcher import TorchTitanSlurmLauncher
 
 
+def frontier_setup_lines() -> list[str]:
+    """Site env previously hardcoded in Engine._setup (behavior freeze)."""
+    return [
+        "module load PrgEnv-gnu/8.6.0",
+        "module load rocm/6.4.1",
+        "module load rccl-net-plugin",
+        "module load craype-accel-amd-gfx90a",
+        "module load miniforge3/23.11.0-0",
+        'export OMNIFED_DATA_DIR="/lustre/orion/gen150/scratch/shruti2395/omnifed_data"',
+        'mkdir -p "$OMNIFED_DATA_DIR"',
+        'echo "[setup] OMNIFED_DATA_DIR=$OMNIFED_DATA_DIR"',
+        'export PYEXE="${PYEXE:-/ccs/home/shruti2395/.conda/envs/pytorch_rocm/bin/python}"',
+        'echo "[setup] PYEXE=$PYEXE"',
+        '"$PYEXE" -c "import torch; print(torch.__version__)"',
+        "",
+        "export MIOPEN_USER_DB_PATH=/tmp/${USER}/miopen-cache",
+        "export MIOPEN_CUSTOM_CACHE_DIR=${MIOPEN_USER_DB_PATH}",
+        "export MIOPEN_FIND_MODE=1",
+        'mkdir -p "$MIOPEN_USER_DB_PATH"',
+    ]
+
+
 class SlurmRuntime:
-    """Prepare and submit an OmniFed Slurm execution."""
+    """Freeze config, sbatch, and exit. Worker is still ``slurm_worker``."""
 
     def __init__(
         self,
         *,
         cfg: Any,
         hydra_cfg: Any,
-        topology: Optional[Any],
-        backend_name: str,
+        topology: Any,
         output_dir: str,
         engine_dir: str,
         repo_root: str,
@@ -29,229 +59,150 @@ class SlurmRuntime:
         self.cfg = cfg
         self.hydra_cfg = hydra_cfg
         self.topology = topology
-        self.backend_name = backend_name
         self.output_dir = output_dir
         self.engine_dir = engine_dir
         self.repo_root = repo_root
 
     def setup(self) -> None:
+
+        titan = uses_torchtitan(self.cfg)
+        worker_name = "torchtitan_worker.py" if titan else "slurm_worker.py"
         if "SLURM_JOB_ID" in os.environ:
-            raise RuntimeError(
-                "Engine was started inside a Slurm allocation. "
-                "The generated Slurm worker module should run there instead."
-            )
+            print(f"[Engine] Inside Slurm allocation; {worker_name} handles execution.")
+            raise SystemExit(0)
 
-        frozen_config_path = self._write_frozen_config()
-        slurm_config = self._build_slurm_config(
-            frozen_config_path
+        cfg_json_path = resolve_slurm_frozen_cfg_path(self.output_dir)
+        from src.omnifed.checkpoint.hybrid_round_checkpoint import (
+            resolve_experiment_checkpoint_dir,
         )
 
-        if self.backend_name == "torchdist":
-            self._submit_torchdist(slurm_config)
-            return
-
-        if self.backend_name == "torchtitan":
-            self._submit_torchtitan(slurm_config)
-            return
-
-        raise ValueError(
-            f"Unsupported Slurm backend: {self.backend_name!r}"
-        )
-
-    @staticmethod
-    def _to_container(
-        value: Any,
-    ) -> Any:
-        if OmegaConf.is_config(value):
-            return OmegaConf.to_container(
-                value,
-                resolve=True,
-            )
-
-        return value
-
-    def _write_frozen_config(self) -> str:
-        # Keep this file inside the unique Hydra run directory.
-        # This prevents concurrent jobs from overwriting one another.
-        frozen_config_path = os.path.join(
-            self.output_dir,
-            "engine_frozen.json",
-        )
-
-        checkpoint_dir = (
-            self.cfg.slurm.checkpoint_dir
-            or os.path.join(self.engine_dir, "ckpt")
+        ckpt_dir = resolve_experiment_checkpoint_dir(self.cfg) or os.path.join(
+            self.engine_dir, "ckpt"
         )
 
         frozen = {
-            "cfg": OmegaConf.to_container(
-                self.cfg,
-                resolve=True,
-            ),
-            "hydra_output_dir": (
-                self.hydra_cfg.runtime.output_dir
-            ),
-            "slurm_checkpoint_dir": checkpoint_dir,
-            "backend": self._to_container(
-                OmegaConf.select(
-                    self.cfg,
-                    "backend",
-                    default={},
-                )
-            ),
-            "torchtitan": self._to_container(
-                OmegaConf.select(
-                    self.cfg,
-                    "torchtitan",
-                    default={},
-                )
-            ),
+            "cfg": OmegaConf.to_container(self.cfg, resolve=True),
+            "hydra_output_dir": self.hydra_cfg.runtime.output_dir,
+            "slurm_checkpoint_dir": ckpt_dir,
         }
+        with open(cfg_json_path, "w") as f:
+            json.dump(frozen, f, indent=2)
 
-        with open(
-            frozen_config_path,
-            "w",
-            encoding="utf-8",
-        ) as file:
-            json.dump(
-                frozen,
-                file,
-                indent=2,
+        slurm_dict = OmegaConf.to_container(self.cfg.slurm, resolve=True)
+        sconf = SlurmConfig(**slurm_dict)
+
+        sconf.work_dir = self.repo_root
+        sconf.cfg_json_path = cfg_json_path
+        sconf.stdout = os.path.join(self.hydra_cfg.runtime.output_dir, "slurm-%j.out")
+        sconf.stderr = os.path.join(self.hydra_cfg.runtime.output_dir, "slurm-%j.err")
+        sconf.pyexe = "python"
+        # sconf.setup_lines = frontier_setup_lines()
+        sconf.setup_lines = build_frontier_setup_lines()
+
+        if titan:
+            self._submit_torchtitan(sconf)
+            return
+
+        topo_nodes = len(list(self.topology))
+        sconf.ntasks = resolve_slurm_ntasks(self.cfg, topo_nodes)
+
+        if is_hierarchical_cfg(self.cfg):
+            print(
+                f"[Engine] topology=hierarchical: Slurm --ntasks={sconf.ntasks} "
+                f"(len(topology)={topo_nodes}).",
+                flush=True,
             )
 
-        return frozen_config_path
-
-    def _build_slurm_config(
-        self,
-        frozen_config_path: str,
-    ) -> SlurmConfig:
-        slurm_dict = OmegaConf.to_container(
-            self.cfg.slurm,
-            resolve=True,
-        )
-
-        if not isinstance(slurm_dict, dict):
-            raise TypeError(
-                "cfg.slurm must resolve to a mapping"
-            )
-
-        slurm_config = SlurmConfig(**slurm_dict)
-
-        slurm_config.work_dir = self.repo_root
-        slurm_config.cfg_json_path = frozen_config_path
-
-        slurm_config.stdout = os.path.join(
-            self.output_dir,
-            "slurm-%j.out",
-        )
-        slurm_config.stderr = os.path.join(
-            self.output_dir,
-            "slurm-%j.err",
-        )
-
-        # The generated setup lines select the actual worker Python.
-        slurm_config.pyexe = "python"
-
-        configured_setup_lines = list(
-            slurm_config.setup_lines
-        )
-
-        slurm_config.setup_lines = (
-            build_frontier_setup_lines()
-            + configured_setup_lines
-        )
-
-        return slurm_config
-
-    def _submit_torchdist(
-        self,
-        slurm_config: SlurmConfig,
-    ) -> None:
-        if self.topology is None:
-            raise RuntimeError(
-                "TorchDist Slurm execution requires a topology"
-            )
-
-        total_tasks = len(self.topology)
-        slurm_config.ntasks = total_tasks
-
-        if (
-            slurm_config.ntasks_per_node
-            and slurm_config.ntasks_per_node > 0
-        ):
+        if sconf.ntasks_per_node and sconf.ntasks_per_node > 0:
             needed_nodes = (
-                total_tasks
-                + slurm_config.ntasks_per_node
-                - 1
-            ) // slurm_config.ntasks_per_node
+                sconf.ntasks + sconf.ntasks_per_node - 1
+            ) // sconf.ntasks_per_node
+            prev_nodes = sconf.nodes
+            sconf.nodes = max(sconf.nodes, needed_nodes)
+            if sconf.nodes != prev_nodes:
+                print(
+                    f"[Engine] slurm.nodes raised {prev_nodes} -> {sconf.nodes} "
+                    f"(need >= ceil(ntasks={sconf.ntasks}/ntasks_per_node="
+                    f"{sconf.ntasks_per_node})={needed_nodes})",
+                    flush=True,
+                )
 
-            slurm_config.nodes = max(
-                slurm_config.nodes,
-                needed_nodes,
-            )
-
-        TorchDistSlurmLauncher.submit_or_exit(
-            slurm_config
+        placement = tasks_per_allocated_node(
+            int(sconf.ntasks), int(sconf.nodes), int(sconf.ntasks_per_node)
         )
-
-    def _submit_torchtitan(
-        self,
-        slurm_config: SlurmConfig,
-    ) -> None:
-        subclusters = OmegaConf.select(
-            self.cfg,
-            "torchtitan.subclusters",
-            default=None,
+        alloc_n = allocation_slot_count(
+            int(sconf.ntasks), int(sconf.nodes), int(sconf.ntasks_per_node)
         )
-
-        if subclusters is None:
-            raise ValueError(
-                "TorchTitan requires torchtitan.subclusters"
-            )
-
-        if not bool(
-            OmegaConf.select(
-                subclusters,
-                "enabled",
-                default=False,
-            )
+        if (
+            sconf.gpus_per_node
+            and int(sconf.gpus_per_node) > 0
+            and int(sconf.ntasks_per_node) > int(sconf.gpus_per_node)
         ):
+            prev_gpus = sconf.gpus_per_node
+            sconf.gpus_per_node = int(sconf.ntasks_per_node)
+            print(
+                f"[Engine] slurm.gpus_per_node raised {prev_gpus} -> "
+                f"{sconf.gpus_per_node} (need >= ntasks_per_node="
+                f"{sconf.ntasks_per_node})",
+                flush=True,
+            )
+        print(
+            f"[Engine] worker_ntasks={sconf.ntasks} alloc_ntasks={alloc_n} "
+            f"rank placement tasks/node={placement} "
+            f"(rank 0 = gRPC server on first host)",
+            flush=True,
+        )
+
+        SlurmOnlyLauncher.submit_or_exit(sconf)
+
+    def _submit_torchtitan(self, sconf: SlurmConfig) -> None:
+        subclusters = OmegaConf.select(self.cfg, "torchtitan.subclusters", default=None)
+        if subclusters is None:
+            raise ValueError("TorchTitan requires torchtitan.subclusters")
+        if not bool(OmegaConf.select(subclusters, "enabled", default=False)):
             raise ValueError(
-                "TorchTitan Slurm execution requires "
-                "torchtitan.subclusters.enabled=true"
+                "TorchTitan requires torchtitan.subclusters.enabled=true"
             )
 
-        num_clients = int(subclusters.num_clients)
-        nodes_per_client = int(
-            subclusters.nodes_per_client
-        )
-        gpus_per_node = int(
-            subclusters.gpus_per_node
-        )
+        num_clients = int(self.topology.num_clients)
+        has_server = topology_has_server(self.topology)
+        nodes_per_client = int(subclusters.nodes_per_client)
+        gpus_per_node = int(subclusters.gpus_per_node)
 
-        slurm_config.nodes = (
-            1
-            + num_clients
-            * nodes_per_client
-        )
+        extra_server = 1 if has_server else 0
+        sconf.nodes = extra_server + num_clients * nodes_per_client
+        sconf.ntasks = None
+        sconf.ntasks_per_node = gpus_per_node
+        sconf.gpus_per_node = gpus_per_node
+        sconf.gpus_per_task = None
+        sconf.gres = None
 
-        slurm_config.ntasks = None
-        slurm_config.ntasks_per_node = gpus_per_node
-        slurm_config.gpus_per_node = gpus_per_node
-        slurm_config.gpus_per_task = None
-        slurm_config.gres = None
+        if has_server:
+            print(
+                f"[Engine] Titan client: nodes={sconf.nodes} "
+                f"(1 server + {num_clients} clients × {nodes_per_client} nodes), "
+                f"gpus_per_node={gpus_per_node}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[Engine] Titan client: nodes={sconf.nodes} "
+                f"(topology has no server, {num_clients} clients × {nodes_per_client} nodes), "
+                f"gpus_per_node={gpus_per_node}",
+                flush=True,
+            )
+
+        federated = OmegaConf.select(self.cfg, "torchtitan.federated", default=None)
+        if federated is None:
+            raise ValueError("TorchTitan requires torchtitan.federated")
 
         launcher_config = {
-            "subclusters": OmegaConf.to_container(
-                subclusters,
-                resolve=True,
-            ),
-            "server_port": int(
-                self.cfg.torchtitan.federated.server_port
-            ),
+            "subclusters": OmegaConf.to_container(subclusters, resolve=True),
+            "server_port": int(federated.server_port),
+            "has_server": has_server,
         }
-
+        launcher_config["subclusters"]["num_clients"] = num_clients
         TorchTitanSlurmLauncher.submit_or_exit(
-            sconf=slurm_config,
+            sconf=sconf,
             launcher_cfg=launcher_config,
         )
