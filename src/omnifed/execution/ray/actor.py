@@ -34,6 +34,7 @@ from ...communicator import (
 from ...data import (
     DataModule,
     DataModuleConfig,
+    apply_federated_shard_env,
 )
 from ...model import ModelConfig
 from ...utils import RequiredSetup, print
