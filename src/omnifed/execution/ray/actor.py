@@ -37,6 +37,11 @@ from ...data import (
     apply_federated_shard_env,
 )
 from ...model import ModelConfig
+from ...summary import (
+    instantiate_model_timed,
+    move_model_to_device_timed,
+    emit_model_startup,
+)
 from ...utils import RequiredSetup, print
 
 
