@@ -150,6 +150,9 @@ class Engine(RequiredSetup):
 
         self.cfg = cfg
         self.hydra_cfg = HydraConfig.get()
+        self.output_dir = str(self.hydra_cfg.runtime.output_dir)
+        self.engine_dir = os.path.join(self.output_dir, "engine")
+        self.results_dir = os.path.join(self.engine_dir, "node_results")
 
         self.uses_torchtitan: bool = uses_torchtitan(cfg)
         if cfg.topology is None:
@@ -275,8 +278,6 @@ class Engine(RequiredSetup):
             hydra_cfg=self.hydra_cfg,
             topology=self.topology,
             results_display=self._results_display,
-            engine_dir=self.engine_dir,
-            results_dir=self.results_dir,
         )
         self.ray_runtime.setup()
 
