@@ -233,7 +233,6 @@ class Engine(RequiredSetup):
         utils.print_rule()
 
         self._setup_output_directories()
-        self._setup_topology()
 
         mode = self.execution_mode
         if self.uses_torchtitan:
