@@ -44,6 +44,11 @@ from src.omnifed.communicator.grpc_factory import (
     create_model_exchange,
 )
 
+import json
+import socket
+import sys
+import traceback
+from datetime import datetime, timezone
 
 def create_torchtitan_algorithm(
     cfg,
@@ -248,6 +253,34 @@ def exchange_model_with_federated_server(
         timer=timer,
     )
 
+
+def log_client_event(role, event, **details):
+    record = {
+        "time_utc": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ),
+        "event": event,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_step": os.environ.get("SLURM_STEP_ID"),
+        "slurm_rank": os.environ.get("SLURM_PROCID"),
+        "client": role.client_id,
+        "rank": role.torchtitan_rank,
+        "local_rank": os.environ.get("LOCAL_RANK"),
+        **details,
+    }
+
+    # Use built-in print to avoid rich formatting/wrapping.
+    import builtins
+
+    builtins.print(
+        "[CLIENT EVENT] " + json.dumps(record, default=str),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def run_torchtitan_client(
     cfg: Any,
     role: TorchTitanRole,
@@ -299,6 +332,9 @@ def run_torchtitan_client(
 
     initial_path, initial_ready_path = get_initial_model_paths(cfg)
 
+    phase = "initialization"
+    round_id = -1
+
     try:
 
         # The federated server owns initialization.  Every client, including
@@ -321,6 +357,8 @@ def run_torchtitan_client(
             os.replace(temporary_path, initial_path)
             initial_ready_path.touch()
 
+        phase = "wait_initial_model"
+        log_client_event(role, "phase_start", phase=phase)
         wait_for_file(initial_ready_path)
 
         print(
@@ -331,6 +369,8 @@ def run_torchtitan_client(
 
         # Load initial ordinary tensors into this client's PP/TP model.
 
+        phase = "load_initial_model"
+        log_client_event(role, "phase_start", phase=phase)
         backend.load_global_model(
             model_path=str(initial_path),
             round_id=-1,
@@ -341,6 +381,8 @@ def run_torchtitan_client(
             "finished initial load",
             flush=True,
         )
+
+        log_client_event(role, "phase_end", phase=phase)
 
         # dist.barrier()
         # maybe_dist_barrier()
@@ -355,6 +397,11 @@ def run_torchtitan_client(
             with timer.measure("torchtitan_local_training_total", round_id):
                 local_steps = int(
                     cfg.torchtitan.federated.local_steps
+                )
+
+                phase = "local_training"
+                log_client_event(
+                    role, "phase_start", phase=phase, round_id=round_id
                 )
 
                 federated_algorithm.before_local_training(
@@ -374,8 +421,16 @@ def run_torchtitan_client(
                     train_result=train_result,
                     round_id=round_id,
                 )
-                
 
+                log_client_event(
+                    role,
+                    "phase_end",
+                    phase=phase,
+                    round_id=round_id,
+                    step=train_result["step"],
+                )
+                
+            phase = "save_and_consolidate"
             with timer.measure("save_sharded_checkpoint_and_consolidate", round_id):
                 local_result = backend.save_and_consolidate(
                     round_id=round_id,
@@ -392,6 +447,7 @@ def run_torchtitan_client(
 
             if role.is_client_leader:
                 if federated:
+                    phase = "grpc_exchange"
                     assert communicator is not None
                     with timer.measure(
                         phase="grpc_round_communication_total",
@@ -416,6 +472,7 @@ def run_torchtitan_client(
                     )
                     aggregated_state = payload["model"]
 
+                phase = "write_global_model"
                 with timer.measure("client_write_global_tensor_model", round_id):
                     global_path.parent.mkdir(
                         parents=True,
@@ -436,6 +493,7 @@ def run_torchtitan_client(
                     global_ready_path.touch()
 
             # Non-leader ranks wait through Lustre, not raw dist.barrier().
+            phase = "wait_global_model"
             with timer.measure("client_wait_for_global_model_file", round_id):
                 wait_for_file(global_ready_path)
 
@@ -444,6 +502,7 @@ def run_torchtitan_client(
             # maybe_dist_barrier()
 
             # Convert global tensors back into PP/TP DTensors.
+            phase = "load_global_model"
             with timer.measure("convert_global_tensor_to_dtensor", round_id):
                 print(
                     f"[client {role.client_id} rank {role.torchtitan_rank}] "
@@ -468,6 +527,25 @@ def run_torchtitan_client(
             # dist.barrier()
             # maybe_dist_barrier()
 
+    except Exception as exc:
+        log_client_event(
+            role,
+            "failure",
+            phase=phase,
+            round_id=round_id,
+            exception_type=type(exc).__name__,
+            exception_message=str(exc),
+            training_iteration=getattr(
+                backend, "debug_iteration", None
+            ),
+            training_step=getattr(
+                backend, "debug_global_step", None
+            ),
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
+
     finally:
 
         # try:
@@ -478,7 +556,16 @@ def run_torchtitan_client(
         if communicator is not None:
             communicator.close()
 
+        log_client_event(
+            role,
+            "cleanup_enter",
+            phase=phase,
+            round_id=round_id,
+        )
+
         backend.close()
+
+        log_client_event(role, "cleanup_exit")
 
 
 def run_torchtitan_federated_server(

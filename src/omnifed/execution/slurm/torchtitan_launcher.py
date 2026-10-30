@@ -118,6 +118,7 @@ class TorchTitanSlurmLauncher:
             f'export CFG_JSON="{sconf.cfg_json_path}"',
             f'CHECKPOINT_ROOT="{checkpoint_root}/job_${{SLURM_JOB_ID}}"',
             'mkdir -p "$CHECKPOINT_ROOT"',
+            'mkdir -p "$CHECKPOINT_ROOT/debug"',
             "",
         ]
 
@@ -177,6 +178,8 @@ class TorchTitanSlurmLauncher:
                     f"srun --exclusive --nodes={nodes_per_client} "
                     f"--ntasks={world_size} --ntasks-per-node={gpus_per_node} "
                     f'--nodelist="$CLIENT_{client_id}_NODES" '
+                    '--output="$CHECKPOINT_ROOT/debug/job-%j-step-%s-rank-%t.out" '
+                    '--error="$CHECKPOINT_ROOT/debug/job-%j-step-%s-rank-%t.err" '
                     f'env OMNIFED_ROLE=client '
                     f'CLIENT_ID={client_id} '
                     f'FEDERATED_RANK={client_id + 1} '
