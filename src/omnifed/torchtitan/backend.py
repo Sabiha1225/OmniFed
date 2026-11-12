@@ -709,12 +709,29 @@ class TorchTitanBackend:
 
 
     def close(self) -> None:
+        trainer = self._trainer
+
         try:
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-                dist.destroy_process_group()
-        except Exception as exc:
-            print(f"[TorchTitanBackend.close] distributed cleanup warning: {exc}", flush=True)
+            if trainer is not None:
+                print("[cleanup] trainer.close() starting", flush=True)
+                trainer.close()
+                print("[cleanup] trainer.close() finished", flush=True)
         finally:
-            self._trainer = None
-            self._config = None
+            try:
+                if dist.is_available() and dist.is_initialized():
+                    print("[cleanup] distributed barrier starting", flush=True)
+                    dist.barrier()
+
+                    print("[cleanup] destroy_process_group starting", flush=True)
+                    dist.destroy_process_group()
+
+                    print("[cleanup] distributed cleanup finished", flush=True)
+            except Exception as exc:
+                print(
+                    f"[TorchTitanBackend.close] "
+                    f"distributed cleanup warning: {exc}",
+                    flush=True,
+                )
+            finally:
+                self._trainer = None
+                self._config = None
