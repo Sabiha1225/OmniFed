@@ -626,13 +626,11 @@ def run_torchtitan_federated_server(
         flush=True,
     )
 
-    # chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
+    chunk_size = int(cfg.torchtitan.federated.grpc_chunk_size_mb)
 
     exchange = create_model_exchange(
         communicator,
-        chunk_size_mb=int(
-            cfg.torchtitan.federated.grpc_chunk_size_mb
-        ),
+        chunk_size_mb=chunk_size,
     )
 
     for round_id in range(int(cfg.global_rounds)):
